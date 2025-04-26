@@ -1,11 +1,13 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
-from datetime import datetime
+from pyspark.sql.functions import col, lit, to_date
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import pytz
+import threading
+import traceback
 
-# Initialize Spark
-spark = SparkSession.builder.appName("Parallel Insert Logic").getOrCreate()
+# Initialize Spark Session
+spark = SparkSession.builder.appName("Insert Logic with Correct Filter and Logging").getOrCreate()
 
 # Setup timezone and paths
 desired_timezone = pytz.timezone("US/Central")
@@ -14,60 +16,87 @@ Today_date = datetime.now(desired_timezone).strftime("%Y-%m-%d")
 full_load_path = "Files/Bronze/STG/DSS_INC_FULL_LOAD_HISTORY_PM"
 staging_path = "Files/Bronze/STG"
 target_path = "Files/Bronze/TST"
-max_ts_path = "Files/Bronze/STG/FULL_LOAD_HIST_MAX_TIMESTAMP"
 object_list_path = "Files/Bronze/COPY_TABLES/POC_TABLE_LIST"
 
-# Read metadata
+# Correct Log Paths
+daily_log_path = "Files/Bronze/STAGING/LOGS/STAGING_DAILY_INSERT_LOGS"
+main_log_path = "Files/Bronze/STAGING/LOGS/STAGING_MAIN_INSERT_LOGS"
+
+# Load static datasets
 object_df = spark.read.parquet(object_list_path)
 active_df = object_df.filter("status = 'A'")
-display(active_df)
+full_load_df = spark.read.parquet(full_load_path).cache()
 
-# Read global inputs
-full_load_df = spark.read.parquet(full_load_path)
-max_ts = spark.read.parquet(max_ts_path).collect()[0]['MAX_TIMESTAMP']
-display(max_ts)
+# Read max timestamp globally
+try:
+    max_ts = spark.read.parquet("Files/Bronze/STG/FULL_LOAD_HIST_MAX_TIMESTAMP").collect()[0]['MAX_TIMESTAMP']
+    print(f"✅ max_ts loaded: {max_ts}")
+except Exception as e:
+    print("❌ Could not load max_ts. Exiting...")
+    raise e
 
-# Get actual folder names in STG and TST (strip trailing slashes)
 stg_folders = [f.name.strip("/") for f in dbutils.fs.ls(staging_path)]
 tst_folders = [f.name.strip("/") for f in dbutils.fs.ls(target_path)]
 
-# Case-insensitive folder matcher
+# Thread-safe lock
+log_write_lock = threading.Lock()
+
+# Helper: Find correct folder matching
 def get_actual_folder(base_list, table_name):
     for folder in base_list:
         if folder.lower() == table_name.lower():
             return folder
-    raise Exception(f"❌ Folder not found for table: {table_name}")
+    raise Exception(f"Folder not found for {table_name}")
 
-# Define processing logic per table
-def process_table(row):
-    table_name = row["OBJECT_NAME"]
-    key_col = row["KEY_COLUMN"].split(',')[0]
+# Ensure daily log exists
+def ensure_log_schema():
+    try:
+        schema = spark.read.parquet(daily_log_path).schema
+    except:
+        try:
+            main_log_df = spark.read.parquet(main_log_path)
+            schema = main_log_df.schema
+            empty_df = spark.createDataFrame([], schema)
+            empty_df.write.mode("overwrite").parquet(daily_log_path)
+        except Exception as ex:
+            print("Error initializing logs:", ex)
+            raise ex
+    return schema
+
+# Update log
+def update_log(table_name, status, start_time, end_time, error_message=""):
+    schema = ensure_log_schema()
+    new_row = [(table_name, status, Today_date, start_time.isoformat(), end_time.isoformat(), error_message)]
+    new_df = spark.createDataFrame(new_row, schema)
+    
+    with log_write_lock:
+        new_df.write.mode("append").parquet(daily_log_path)
+    print(f"Log updated for {table_name} - {status}")
+
+# Insert logic per table
+def process_table(row_dict):
+    table_name = row_dict["OBJECT_NAME"]
+    key_col = row_dict["KEY_COLUMN"].split(',')[0]
     table_name_lower = table_name.lower()
+    start_time = datetime.now()
 
     try:
-        # Match actual folder names for STG and TST
         stg_folder = get_actual_folder(stg_folders, table_name)
         tst_folder = get_actual_folder(tst_folders, table_name)
 
-        # Read source data
         stg_df = spark.read.parquet(f"{staging_path}/{stg_folder}")
         try:
             target_df = spark.read.parquet(f"{target_path}/{tst_folder}")
         except:
             target_df = spark.createDataFrame([], stg_df.schema)
 
-        print({table_name_lower, key_col})
-        display(stg_df)
-
-        # Filter full load for the table
+        # ✅ Corrected Timestamp filter: UTCTimestamp > max_ts
         filtered_full_df = full_load_df.filter(
-            (col("UTCTimestamp") < max_ts) &
+            (col("UTCTimestamp") > max_ts) &
             (col("type") == "Insert") &
             (col("table_name") == table_name_lower)
         )
-        display(filtered_full_df)
 
-        # Perform joins
         join_df = filtered_full_df.join(
             stg_df, filtered_full_df["row_number"] == stg_df[key_col], "inner"
         ).select(stg_df["*"]).dropDuplicates()
@@ -76,15 +105,76 @@ def process_table(row):
             target_df, join_df[key_col] == target_df[key_col], "left_anti"
         )
 
-        # Save insert data
         insert_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_INSERT")
-        print(f"✅ Insert done for {table_name}")
+
+        end_time = datetime.now()
+        print(f"✅ SUCCESS: {table_name}")
+        update_log(table_name, "SUCCESS", start_time, end_time)
 
     except Exception as e:
-        print(f"❌ Failed for {table_name}: {e}")
+        end_time = datetime.now()
+        error_message = traceback.format_exc()
+        print(f"❌ FAILURE for {table_name}: {e}")
+        update_log(table_name, "FAILURE", start_time, end_time, error_message)
 
-# Run in parallel
-with ThreadPoolExecutor(max_workers=10) as executor:
-    futures = [executor.submit(process_table, row.asDict()) for row in active_df.collect()]
-    for future in as_completed(futures):
-        future.result()
+# Main Execution
+try:
+    main_log_df = spark.read.parquet(main_log_path)
+    failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
+    failed_today_tables = [row["table_name"] for row in failed_today_df.collect()]
+    main_logged_today_tables = main_log_df.filter(f"load_date = '{Today_date}'") \
+        .select("table_name").distinct().rdd.flatMap(lambda x: x).collect()
+
+    if failed_today_tables:
+        tables_to_run = [item for item in active_df.collect() if item["OBJECT_NAME"] in failed_today_tables]
+        print(f"Retrying only failed tables: {[row['OBJECT_NAME'] for row in tables_to_run]}")
+    elif set([x["OBJECT_NAME"] for x in active_df.collect()]).issubset(set(main_logged_today_tables)):
+        tables_to_run = []
+        print("All tables already processed today.")
+    else:
+        tables_to_run = active_df.collect()
+        print("Running all active tables first time.")
+except Exception as e:
+    print("No main log found — running all tables.")
+    tables_to_run = active_df.collect()
+
+# Execute tables
+if tables_to_run:
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(process_table, row.asDict()) for row in tables_to_run]
+        for future in as_completed(futures):
+            future.result()
+
+    # Merge daily into main log
+    try:
+        main_log_df = spark.read.parquet(main_log_path)
+        spark.catalog.refreshByPath(daily_log_path)
+        daily_log_df = spark.read.parquet(daily_log_path)
+    except Exception as e:
+        print("Daily log missing, using empty.")
+        daily_log_df = spark.createDataFrame([], main_log_df.schema)
+
+    tables_today = [row["table_name"] for row in daily_log_df.select("table_name").distinct().collect()]
+    cleaned_main_log_df = main_log_df.filter(~((col("load_date") == Today_date) & (col("table_name").isin(tables_today))))
+    final_main_log_df = cleaned_main_log_df.unionByName(daily_log_df)
+
+    temp_main_log_path = main_log_path + "_tmp"
+    final_main_log_df.write.mode("overwrite").parquet(temp_main_log_path)
+
+    # Atomic Replace
+    sc = spark.sparkContext
+    hadoop_conf = sc._jsc.hadoopConfiguration()
+    fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+    Path = sc._jvm.org.apache.hadoop.fs.Path
+
+    main_path = Path(main_log_path)
+    temp_path = Path(temp_main_log_path)
+    daily_path = Path(daily_log_path)
+
+    if fs.exists(main_path):
+        fs.delete(main_path, True)
+    fs.rename(temp_path, main_path)
+    if fs.exists(daily_path):
+        fs.delete(daily_path, True)
+
+    print("✅ Main log updated and daily log cleaned up.")
