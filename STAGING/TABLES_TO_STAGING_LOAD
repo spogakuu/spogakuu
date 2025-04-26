@@ -1,0 +1,90 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pytz
+
+# Initialize Spark
+spark = SparkSession.builder.appName("Parallel Insert Logic").getOrCreate()
+
+# Setup timezone and paths
+desired_timezone = pytz.timezone("US/Central")
+Today_date = datetime.now(desired_timezone).strftime("%Y-%m-%d")
+
+full_load_path = "Files/Bronze/STG/DSS_INC_FULL_LOAD_HISTORY_PM"
+staging_path = "Files/Bronze/STG"
+target_path = "Files/Bronze/TST"
+max_ts_path = "Files/Bronze/STG/FULL_LOAD_HIST_MAX_TIMESTAMP"
+object_list_path = "Files/Bronze/COPY_TABLES/POC_TABLE_LIST"
+
+# Read metadata
+object_df = spark.read.parquet(object_list_path)
+active_df = object_df.filter("status = 'A'")
+display(active_df)
+
+# Read global inputs
+full_load_df = spark.read.parquet(full_load_path)
+max_ts = spark.read.parquet(max_ts_path).collect()[0]['MAX_TIMESTAMP']
+display(max_ts)
+
+# Get actual folder names in STG and TST (strip trailing slashes)
+stg_folders = [f.name.strip("/") for f in dbutils.fs.ls(staging_path)]
+tst_folders = [f.name.strip("/") for f in dbutils.fs.ls(target_path)]
+
+# Case-insensitive folder matcher
+def get_actual_folder(base_list, table_name):
+    for folder in base_list:
+        if folder.lower() == table_name.lower():
+            return folder
+    raise Exception(f"❌ Folder not found for table: {table_name}")
+
+# Define processing logic per table
+def process_table(row):
+    table_name = row["OBJECT_NAME"]
+    key_col = row["KEY_COLUMN"].split(',')[0]
+    table_name_lower = table_name.lower()
+
+    try:
+        # Match actual folder names for STG and TST
+        stg_folder = get_actual_folder(stg_folders, table_name)
+        tst_folder = get_actual_folder(tst_folders, table_name)
+
+        # Read source data
+        stg_df = spark.read.parquet(f"{staging_path}/{stg_folder}")
+        try:
+            target_df = spark.read.parquet(f"{target_path}/{tst_folder}")
+        except:
+            target_df = spark.createDataFrame([], stg_df.schema)
+
+        print({table_name_lower, key_col})
+        display(stg_df)
+
+        # Filter full load for the table
+        filtered_full_df = full_load_df.filter(
+            (col("UTCTimestamp") < max_ts) &
+            (col("type") == "Insert") &
+            (col("table_name") == table_name_lower)
+        )
+        display(filtered_full_df)
+
+        # Perform joins
+        join_df = filtered_full_df.join(
+            stg_df, filtered_full_df["row_number"] == stg_df[key_col], "inner"
+        ).select(stg_df["*"]).dropDuplicates()
+
+        insert_df = join_df.join(
+            target_df, join_df[key_col] == target_df[key_col], "left_anti"
+        )
+
+        # Save insert data
+        insert_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_INSERT")
+        print(f"✅ Insert done for {table_name}")
+
+    except Exception as e:
+        print(f"❌ Failed for {table_name}: {e}")
+
+# Run in parallel
+with ThreadPoolExecutor(max_workers=10) as executor:
+    futures = [executor.submit(process_table, row.asDict()) for row in active_df.collect()]
+    for future in as_completed(futures):
+        future.result()
