@@ -18,8 +18,8 @@ full_load_path = "Files/Bronze/STG/DSS_INC_FULL_LOAD_HISTORY_PM"
 staging_path = "Files/Bronze/STG"
 target_path = "Files/Bronze/TST"
 object_list_path = "Files/Bronze/COPY_TABLES/POC_TABLE_LIST"
-daily_log_path = "Files/Bronze/STAGING/LOGS/STAGING_DAILY_INSERT_LOGS"
-main_log_path = "Files/Bronze/STAGING/LOGS/STAGING_MAIN_INSERT_LOGS"
+daily_log_path = "Files/Bronze/LOGS/STAGING_DAILY_INSERT_LOGS"
+main_log_path = "Files/Bronze/LOGS/STAGING_MAIN_INSERT_LOGS"
 
 # Load static datasets
 object_df = spark.read.parquet(object_list_path)
@@ -122,13 +122,13 @@ def process_table(row_dict):
         insert_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_INSERT")
 
         end_time = datetime.now()
-        print(f"✅ SUCCESS: {table_name}")
+        print(f"SUCCESS: {table_name}")
         update_log(table_name, "SUCCESS", start_time, end_time)
 
     except Exception as e:
         end_time = datetime.now()
         error_message = traceback.format_exc()
-        print(f"❌ FAILURE for {table_name}: {e}")
+        print(f"FAILURE for {table_name}: {e}")
         update_log(table_name, "FAILURE", start_time, end_time, error_message)
 
 # Decide which tables to run
@@ -154,7 +154,7 @@ except Exception as e:
 
 # Execute in parallel
 if tables_to_run:
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=17) as executor:
         futures = [executor.submit(process_table, row.asDict()) for row in tables_to_run]
         for future in as_completed(futures):
             future.result()
