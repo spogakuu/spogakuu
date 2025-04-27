@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, lit, current_timestamp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pytz
@@ -13,7 +13,7 @@ spark = SparkSession.builder.appName("Update Logic Full Fabric").getOrCreate()
 desired_timezone = pytz.timezone("US/Central")
 Today_date = datetime.now(desired_timezone).strftime("%Y-%m-%d")
 
-# Paths (Unified Log Paths)
+# Paths
 full_load_path = "Files/Bronze/STG/DSS_INC_FULL_LOAD_HISTORY_PM"
 staging_path = "Files/Bronze/STG"
 target_path = "Files/Bronze/TST"
@@ -21,7 +21,7 @@ object_list_path = "Files/Bronze/COPY_TABLES/POC_TABLE_LIST"
 daily_log_path = "Files/Bronze/LOGS/STAGING_DAILY_LOGS"
 main_log_path = "Files/Bronze/LOGS/STAGING_MAIN_LOGS"
 
-# Load metadata and full_load once
+# Load metadata
 object_df = spark.read.parquet(object_list_path)
 active_df = object_df.filter("status = 'A'")
 full_load_df = spark.read.parquet(full_load_path).cache()
@@ -34,7 +34,7 @@ except Exception as e:
     print("❌ Could not load max_ts. Exiting...")
     raise e
 
-# Setup filesystem access
+# Filesystem helpers
 sc = spark.sparkContext
 hadoop_conf = sc._jsc.hadoopConfiguration()
 fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
@@ -53,10 +53,9 @@ def list_folders(base_path):
 stg_folders = list_folders(staging_path)
 tst_folders = list_folders(target_path)
 
-# Lock for thread-safe logging
+# Thread-safe log writing
 log_write_lock = threading.Lock()
 
-# Helper functions
 def get_actual_folder(base_list, table_name):
     for folder in base_list:
         if folder.lower() == table_name.lower():
@@ -117,6 +116,10 @@ def process_table_update(row_dict):
             target_df, join_df[key_col] == target_df[key_col], "inner"
         )
 
+        # ✅ Here add status and insert_timestamp dynamically
+        update_df = update_df.withColumn("status", lit('U')).withColumn("insert_timestamp", current_timestamp())
+
+        # ✅ Save final
         update_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_UPDATE")
 
         end_time = datetime.now()
@@ -129,7 +132,7 @@ def process_table_update(row_dict):
         print(f"❌ UPDATE FAILURE for {table_name}: {e}")
         update_log(table_name + '_UPDATE', "FAILURE", start_time, end_time, error_message)
 
-# Select tables to process
+# Decide tables to run
 try:
     main_log_df = spark.read.parquet(main_log_path)
     failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
@@ -150,7 +153,7 @@ except Exception as e:
     print("No main log found — running all tables.")
     tables_to_run = active_df.collect()
 
-# Execute with ThreadPool
+# Execute in parallel
 if tables_to_run:
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(process_table_update, row.asDict()) for row in tables_to_run]
@@ -170,7 +173,7 @@ tables_today = [row["table_name"] for row in daily_log_df.select("table_name").d
 cleaned_main_log_df = main_log_df.filter(~((col("load_date") == Today_date) & (col("table_name").isin(tables_today))))
 final_main_log_df = cleaned_main_log_df.unionByName(daily_log_df)
 
-# Save
+# Save updated main log
 temp_main_log_path = main_log_path + "_tmp"
 final_main_log_df.write.mode("overwrite").parquet(temp_main_log_path)
 
@@ -186,10 +189,10 @@ if fs.exists(daily_path):
 
 print("✅ Main log updated and daily log cleaned.")
 
-# Recreate Daily Log if Missing
+# Recreate daily log if missing
 try:
     if not fs.exists(daily_path):
-        print("Daily log missing. Recreating from main log schema...")
+        print("Daily log missing. Recreating...")
         main_log_df = spark.read.parquet(main_log_path)
         schema = main_log_df.schema
         empty_daily_log_df = spark.createDataFrame([], schema)
@@ -198,6 +201,6 @@ try:
     else:
         print("✅ Daily log already exists.")
 except Exception as final_error:
-    print("❌ Error during daily log recreation:", final_error)
+    print("❌ Error recreating daily log:", final_error)
 
-print("✅ Update process completed successfully!")
+print("✅ Update process with status and insert_timestamp completed successfully!")
