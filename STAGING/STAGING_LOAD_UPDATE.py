@@ -87,7 +87,7 @@ def update_log(table_name, status, start_time, end_time, error_message=""):
         new_df.write.mode("append").parquet(daily_log_path)
     print(f"Log updated for {table_name} - {status}")
 
-# Update logic per table (💥 aliasing clean version + _UPDATE in log)
+# ✅ Update logic per table (now with Status = 'U' and Insert_Timestamp)
 def process_table(row_dict):
     table_name = row_dict["OBJECT_NAME"]
     key_col = row_dict["KEY_COLUMN"].split(',')[0]
@@ -117,6 +117,10 @@ def process_table(row_dict):
         update_df = join_df.alias("new").join(
             target_df.alias("existing"), col(f"new.{key_col}") == col(f"existing.{key_col}"), "inner"
         ).select("new.*")
+
+        # ✅ Add Status = 'U' and Insert_Timestamp
+        update_df = update_df.withColumn("Status", lit("U")) \
+                             .withColumn("Insert_Timestamp", current_timestamp())
 
         update_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_UPDATE")
 
@@ -197,4 +201,4 @@ try:
 except Exception as final_error:
     print("❌ Final step error while checking/creating daily log:", final_error)
 
-print("✅ Update process with smart skip/retry completed successfully!")
+print("✅ Update process")
