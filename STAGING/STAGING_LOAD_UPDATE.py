@@ -7,7 +7,7 @@ import threading
 import traceback
 
 # Initialize Spark
-spark = SparkSession.builder.appName("Update Logic FINAL with Aliases").getOrCreate()
+spark = SparkSession.builder.appName("FINAL Update Logic").getOrCreate()
 
 # Setup timezone
 desired_timezone = pytz.timezone("US/Central")
@@ -21,7 +21,7 @@ object_list_path = "Files/Bronze/COPY_TABLES/POC_TABLE_LIST"
 daily_log_path = "Files/Bronze/LOGS/STAGING_DAILY_LOGS"
 main_log_path = "Files/Bronze/LOGS/STAGING_MAIN_LOGS"
 
-# Load datasets
+# Load metadata
 object_df = spark.read.parquet(object_list_path)
 active_df = object_df.filter("status = 'A'")
 full_load_df = spark.read.parquet(full_load_path).cache()
@@ -96,45 +96,48 @@ def process_table_update(row_dict):
         stg_folder = get_actual_folder(stg_folders, table_name)
         tst_folder = get_actual_folder(tst_folders, table_name)
 
-        stg_df = spark.read.parquet(f"{staging_path}/{stg_folder}").alias("STG")
+        stg_df = spark.read.parquet(f"{staging_path}/{stg_folder}")
         try:
             target_df = spark.read.parquet(f"{target_path}/{tst_folder}")
         except:
             target_df = spark.createDataFrame([], stg_df.schema)
 
-        # Filter Full Load with alias
-        filtered_full_df = full_load_df.alias("FULL_LOAD").filter(
-            (col("FULL_LOAD.UTCTimeStamp") > max_ts) &
-            (col("FULL_LOAD.type") == "Insert") &
-            (col("FULL_LOAD.table_name") == table_name_lower)
+        # Filter Full Load
+        filtered_full_df = full_load_df.filter(
+            (col("UTCTimeStamp") > max_ts) &
+            (col("type") == "Insert") &
+            (col("table_name") == table_name_lower)
         )
 
-        # Join FULL_LOAD with STG
+        # Join full_load with staging
         join_df = filtered_full_df.join(
-            stg_df, col("FULL_LOAD.row_number") == col(f"STG.{key_col}"), "inner"
+            stg_df, filtered_full_df["row_number"] == stg_df[key_col], "inner"
         )
 
-        # Select only STG columns after join
+        # Select only staging columns after join
         columns_to_keep = stg_df.columns
         join_df = join_df.select(columns_to_keep).dropDuplicates()
 
-        # Slim target_df to key column
+        # ✅ CLEAN the column names to remove any alias reference
+        join_df = join_df.selectExpr(*[f"`{c}`" for c in join_df.columns])
+
+        # Now slim target
         target_slim_df = target_df.select(key_col)
 
-        # Join with slimmed target
+        # Safe join
         update_df = join_df.join(
             target_slim_df, join_df[key_col] == target_slim_df[key_col], "inner"
         )
 
-        # Drop 'status' and 'insert_timestamp' if already exists
+        # Drop existing 'status' or 'insert_timestamp'
         for col_to_add in ["status", "insert_timestamp"]:
             if col_to_add in update_df.columns:
                 update_df = update_df.drop(col_to_add)
 
-        # Add 'status' and 'insert_timestamp'
+        # Add new columns
         update_df = update_df.withColumn("status", lit('U')).withColumn("insert_timestamp", current_timestamp())
 
-        # Save Update View
+        # Save
         update_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_UPDATE")
 
         end_time = datetime.now()
@@ -147,7 +150,7 @@ def process_table_update(row_dict):
         print(f"❌ UPDATE FAILURE for {table_name}: {e}")
         update_log(table_name + '_UPDATE', "FAILURE", start_time, end_time, error_message)
 
-# Select tables to run
+# Select tables
 try:
     main_log_df = spark.read.parquet(main_log_path)
     failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
@@ -202,20 +205,4 @@ fs.rename(temp_path, main_path)
 if fs.exists(daily_path):
     fs.delete(daily_path, True)
 
-print("✅ Main log updated and daily log cleaned.")
-
-# Recreate Daily Log if missing
-try:
-    if not fs.exists(daily_path):
-        print("Daily log missing. Recreating...")
-        main_log_df = spark.read.parquet(main_log_path)
-        schema = main_log_df.schema
-        empty_daily_log_df = spark.createDataFrame([], schema)
-        empty_daily_log_df.write.mode("overwrite").parquet(daily_log_path)
-        print("✅ Daily log recreated.")
-    else:
-        print("✅ Daily log already exists.")
-except Exception as final_error:
-    print("❌ Error recreating daily log:", final_error)
-
-print("✅ FINAL Update process completed successfully with Aliases, No Duplicate, No Ambiguous!")
+print("✅ FINAL Update Process completed successfully — No Duplicate Columns, No Ambiguous References!")
