@@ -6,8 +6,8 @@ import pytz
 import threading
 import traceback
 
-# Initialize Spark Session
-spark = SparkSession.builder.appName("Update Logic FINAL CLEAN").getOrCreate()
+# Initialize Spark
+spark = SparkSession.builder.appName("Update Logic FINAL with Aliases").getOrCreate()
 
 # Setup timezone
 desired_timezone = pytz.timezone("US/Central")
@@ -53,7 +53,7 @@ def list_folders(base_path):
 stg_folders = list_folders(staging_path)
 tst_folders = list_folders(target_path)
 
-# Thread-safe log writing
+# Thread-safe logging
 log_write_lock = threading.Lock()
 
 def get_actual_folder(base_list, table_name):
@@ -96,45 +96,45 @@ def process_table_update(row_dict):
         stg_folder = get_actual_folder(stg_folders, table_name)
         tst_folder = get_actual_folder(tst_folders, table_name)
 
-        stg_df = spark.read.parquet(f"{staging_path}/{stg_folder}")
+        stg_df = spark.read.parquet(f"{staging_path}/{stg_folder}").alias("STG")
         try:
             target_df = spark.read.parquet(f"{target_path}/{tst_folder}")
         except:
             target_df = spark.createDataFrame([], stg_df.schema)
 
-        # Filter Full Load
-        filtered_full_df = full_load_df.filter(
-            (col("UTCTimestamp") > max_ts) &
-            (col("type") == "Insert") &
-            (col("table_name") == table_name_lower)
+        # Filter Full Load with alias
+        filtered_full_df = full_load_df.alias("FULL_LOAD").filter(
+            (col("FULL_LOAD.UTCTimeStamp") > max_ts) &
+            (col("FULL_LOAD.type") == "Insert") &
+            (col("FULL_LOAD.table_name") == table_name_lower)
         )
 
-        # ✅ Join full_load with stg_df
+        # Join FULL_LOAD with STG
         join_df = filtered_full_df.join(
-            stg_df, filtered_full_df["row_number"] == stg_df[key_col], "inner"
+            stg_df, col("FULL_LOAD.row_number") == col(f"STG.{key_col}"), "inner"
         )
 
-        # ✅ After join, select only stg_df columns (very important to avoid duplicates!)
+        # Select only STG columns after join
         columns_to_keep = stg_df.columns
         join_df = join_df.select(columns_to_keep).dropDuplicates()
 
-        # ✅ Slim target_df to only key column
+        # Slim target_df to key column
         target_slim_df = target_df.select(key_col)
 
-        # ✅ Join again safely
+        # Join with slimmed target
         update_df = join_df.join(
             target_slim_df, join_df[key_col] == target_slim_df[key_col], "inner"
         )
 
-        # ✅ Drop if 'status' or 'insert_timestamp' already exist
+        # Drop 'status' and 'insert_timestamp' if already exists
         for col_to_add in ["status", "insert_timestamp"]:
             if col_to_add in update_df.columns:
                 update_df = update_df.drop(col_to_add)
 
-        # ✅ Add status = 'U' and insert_timestamp
+        # Add 'status' and 'insert_timestamp'
         update_df = update_df.withColumn("status", lit('U')).withColumn("insert_timestamp", current_timestamp())
 
-        # ✅ Save Update View
+        # Save Update View
         update_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_UPDATE")
 
         end_time = datetime.now()
@@ -204,7 +204,7 @@ if fs.exists(daily_path):
 
 print("✅ Main log updated and daily log cleaned.")
 
-# Recreate daily log if missing
+# Recreate Daily Log if missing
 try:
     if not fs.exists(daily_path):
         print("Daily log missing. Recreating...")
@@ -218,4 +218,4 @@ try:
 except Exception as final_error:
     print("❌ Error recreating daily log:", final_error)
 
-print("✅ FINAL Update process completed successfully! No duplicate column issues!")
+print("✅ FINAL Update process completed successfully with Aliases, No Duplicate, No Ambiguous!")
