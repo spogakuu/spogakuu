@@ -6,8 +6,8 @@ import pytz
 import threading
 import traceback
 
-# Initialize Spark
-spark = SparkSession.builder.appName("Update Logic Full Fabric").getOrCreate()
+# Initialize Spark Session
+spark = SparkSession.builder.appName("Update Logic Final Clean").getOrCreate()
 
 # Setup timezone
 desired_timezone = pytz.timezone("US/Central")
@@ -21,7 +21,7 @@ object_list_path = "Files/Bronze/COPY_TABLES/POC_TABLE_LIST"
 daily_log_path = "Files/Bronze/LOGS/STAGING_DAILY_LOGS"
 main_log_path = "Files/Bronze/LOGS/STAGING_MAIN_LOGS"
 
-# Load metadata
+# Load metadata and full_load
 object_df = spark.read.parquet(object_list_path)
 active_df = object_df.filter("status = 'A'")
 full_load_df = spark.read.parquet(full_load_path).cache()
@@ -53,7 +53,7 @@ def list_folders(base_path):
 stg_folders = list_folders(staging_path)
 tst_folders = list_folders(target_path)
 
-# Thread-safe log writing
+# Thread-safe logging
 log_write_lock = threading.Lock()
 
 def get_actual_folder(base_list, table_name):
@@ -102,24 +102,35 @@ def process_table_update(row_dict):
         except:
             target_df = spark.createDataFrame([], stg_df.schema)
 
+        # Filter Full Load for Inserts
         filtered_full_df = full_load_df.filter(
             (col("UTCTimestamp") > max_ts) &
             (col("type") == "Insert") &
             (col("table_name") == table_name_lower)
         )
 
+        # Join full_load with staging (bring new data)
         join_df = filtered_full_df.join(
             stg_df, filtered_full_df["row_number"] == stg_df[key_col], "inner"
         ).select(stg_df["*"]).dropDuplicates()
 
+        # ✅ Slim down target_df: only select key column to avoid duplicates
+        target_slim_df = target_df.select(key_col)
+
+        # Now safely join
         update_df = join_df.join(
-            target_df, join_df[key_col] == target_df[key_col], "inner"
+            target_slim_df, join_df[key_col] == target_slim_df[key_col], "inner"
         )
 
-        # ✅ Here add status and insert_timestamp dynamically
+        # ✅ Drop if columns already exist
+        for col_to_add in ["status", "insert_timestamp"]:
+            if col_to_add in update_df.columns:
+                update_df = update_df.drop(col_to_add)
+
+        # ✅ Add status and insert_timestamp
         update_df = update_df.withColumn("status", lit('U')).withColumn("insert_timestamp", current_timestamp())
 
-        # ✅ Save final
+        # ✅ Save Update View
         update_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_UPDATE")
 
         end_time = datetime.now()
@@ -132,7 +143,7 @@ def process_table_update(row_dict):
         print(f"❌ UPDATE FAILURE for {table_name}: {e}")
         update_log(table_name + '_UPDATE', "FAILURE", start_time, end_time, error_message)
 
-# Decide tables to run
+# Select tables to run
 try:
     main_log_df = spark.read.parquet(main_log_path)
     failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
@@ -173,7 +184,7 @@ tables_today = [row["table_name"] for row in daily_log_df.select("table_name").d
 cleaned_main_log_df = main_log_df.filter(~((col("load_date") == Today_date) & (col("table_name").isin(tables_today))))
 final_main_log_df = cleaned_main_log_df.unionByName(daily_log_df)
 
-# Save updated main log
+# Save main log
 temp_main_log_path = main_log_path + "_tmp"
 final_main_log_df.write.mode("overwrite").parquet(temp_main_log_path)
 
@@ -189,7 +200,7 @@ if fs.exists(daily_path):
 
 print("✅ Main log updated and daily log cleaned.")
 
-# Recreate daily log if missing
+# Recreate Daily Log if missing
 try:
     if not fs.exists(daily_path):
         print("Daily log missing. Recreating...")
@@ -203,4 +214,4 @@ try:
 except Exception as final_error:
     print("❌ Error recreating daily log:", final_error)
 
-print("✅ Update process with status and insert_timestamp completed successfully!")
+print("✅ Update process completed successfully with Slim Join + Status + Insert_Timestamp!")
