@@ -87,7 +87,7 @@ def update_log(table_name, status, start_time, end_time, error_message=""):
         new_df.write.mode("append").parquet(daily_log_path)
     print(f"Log updated for {table_name} - {status}")
 
-# Delete logic per table
+# ✅ Delete logic per table (adding Status and Insert_Timestamp)
 def process_table(row_dict):
     table_name = row_dict["OBJECT_NAME"]
     key_col = row_dict["KEY_COLUMN"].split(',')[0]
@@ -113,6 +113,10 @@ def process_table(row_dict):
             target_df, col("full.row_number") == col(f"tgt.{key_col}"), "inner"
         ).select("tgt.*").dropDuplicates()
 
+        # ✅ Add Status = 'D' and Insert_Timestamp
+        delete_df = delete_df.withColumn("Status", lit("D")) \
+                             .withColumn("Insert_Timestamp", current_timestamp())
+
         delete_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_DELETE")
 
         end_time = datetime.now()
@@ -136,11 +140,9 @@ try:
     all_active_tables = [item for item in active_df.collect()]
 
     if failed_today_tables:
-        # Retry only failed _DELETE tables
         tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_DELETE") in failed_today_tables]
         print(f"Retrying failed DELETE tables only: {[row['OBJECT_NAME'] for row in tables_to_run]}")
     else:
-        # Only run tables not already processed successfully today
         processed_tables_today = set(main_logged_today_tables)
         tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_DELETE") not in processed_tables_today]
         print(f"Running only pending DELETE tables: {[row['OBJECT_NAME'] for row in tables_to_run]}")
