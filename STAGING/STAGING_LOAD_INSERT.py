@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit, to_date
+from pyspark.sql.functions import col, lit, to_date, current_timestamp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pytz
@@ -87,7 +87,7 @@ def update_log(table_name, status, start_time, end_time, error_message=""):
         new_df.write.mode("append").parquet(daily_log_path)
     print(f"Log updated for {table_name} - {status}")
 
-# Insert logic per table
+# ✅ Insert logic per table (adding Status and Insert_Timestamp)
 def process_table(row_dict):
     table_name = row_dict["OBJECT_NAME"]
     key_col = row_dict["KEY_COLUMN"].split(',')[0]
@@ -114,6 +114,10 @@ def process_table(row_dict):
             stg_df, filtered_full_df["row_number"] == stg_df[key_col], "inner"
         ).select(stg_df["*"]).dropDuplicates()
 
+        # ✅ Add Status = 'I' and Insert_Timestamp = current time
+        join_df = join_df.withColumn("Status", lit("I")) \
+                         .withColumn("Insert_Timestamp", current_timestamp())
+
         insert_df = join_df.join(
             target_df, join_df[key_col] == target_df[key_col], "left_anti"
         )
@@ -122,13 +126,13 @@ def process_table(row_dict):
 
         end_time = datetime.now()
         print(f"SUCCESS: {table_name}")
-        update_log(table_name + "_INSERT", "SUCCESS", start_time, end_time)  # ✅ _INSERT added in log
+        update_log(table_name + "_INSERT", "SUCCESS", start_time, end_time)
 
     except Exception as e:
         end_time = datetime.now()
         error_message = traceback.format_exc()
         print(f"FAILURE for {table_name}: {e}")
-        update_log(table_name + "_INSERT", "FAILURE", start_time, end_time, error_message)  # ✅ _INSERT added in log
+        update_log(table_name + "_INSERT", "FAILURE", start_time, end_time, error_message)
 
 # ✅ Smarter decide which tables to run for INSERT
 try:
@@ -141,11 +145,9 @@ try:
     all_active_tables = [item for item in active_df.collect()]
 
     if failed_today_tables:
-        # Retry only failed _INSERT tables
         tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_INSERT") in failed_today_tables]
         print(f"Retrying failed INSERT tables only: {[row['OBJECT_NAME'] for row in tables_to_run]}")
     else:
-        # Skip already processed _INSERT tables
         processed_tables_today = set(main_logged_today_tables)
         tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_INSERT") not in processed_tables_today]
         if tables_to_run:
@@ -206,6 +208,4 @@ try:
     else:
         print("✅ Daily log already exists.")
 except Exception as final_error:
-    print("❌ Final step error while checking/creating daily log:", final_error)
-
-print("✅ Insert process with smart skip/retry completed successfully!")
+    print("final_error")
