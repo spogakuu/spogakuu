@@ -1,5 +1,3 @@
--- Update 
-
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, to_date, current_timestamp
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,7 +87,7 @@ def update_log(table_name, status, start_time, end_time, error_message=""):
         new_df.write.mode("append").parquet(daily_log_path)
     print(f"Log updated for {table_name} - {status}")
 
-# Update logic per table (💥 aliasing clean version)
+# Update logic per table (💥 aliasing clean version + _UPDATE in log)
 def process_table(row_dict):
     table_name = row_dict["OBJECT_NAME"]
     key_col = row_dict["KEY_COLUMN"].split(',')[0]
@@ -108,34 +106,31 @@ def process_table(row_dict):
 
         filtered_full_df = full_load_df.filter(
             (col("UTCTimestamp") > max_ts) &
-            (col("type") == "Insert") &
+            (col("type") == "Insert") &    
             (col("table_name") == table_name_lower)
         ).alias("full")
 
-        # Step 1: Join STG with FULL to get the records
         join_df = filtered_full_df.join(
             stg_df, col("full.row_number") == col(f"stg.{key_col}"), "inner"
         ).select("stg.*").dropDuplicates()
 
-        # Step 2: Inner join to pick matching records only
         update_df = join_df.alias("new").join(
             target_df.alias("existing"), col(f"new.{key_col}") == col(f"existing.{key_col}"), "inner"
         ).select("new.*")
 
-        # Write Update view
         update_df.write.mode("overwrite").parquet(f"Files/Bronze/NEW_VIEWS/{table_name_lower}_UPDATE")
 
         end_time = datetime.now()
         print(f"SUCCESS: {table_name}")
-        update_log(table_name, "SUCCESS", start_time, end_time)
+        update_log(table_name + "_UPDATE", "SUCCESS", start_time, end_time)
 
     except Exception as e:
         end_time = datetime.now()
         error_message = traceback.format_exc()
         print(f"FAILURE for {table_name}: {e}")
-        update_log(table_name, "FAILURE", start_time, end_time, error_message)
+        update_log(table_name + "_UPDATE", "FAILURE", start_time, end_time, error_message)
 
-# Decide which tables to run
+# ✅ Smarter decide which tables to run for UPDATE
 try:
     main_log_df = spark.read.parquet(main_log_path)
     failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
@@ -143,15 +138,16 @@ try:
     main_logged_today_tables = main_log_df.filter(f"load_date = '{Today_date}'") \
         .select("table_name").distinct().rdd.flatMap(lambda x: x).collect()
 
+    all_active_tables = [item for item in active_df.collect()]
+
     if failed_today_tables:
-        tables_to_run = [item for item in active_df.collect() if item["OBJECT_NAME"] in failed_today_tables]
-        print(f"Retrying only failed tables: {[row['OBJECT_NAME'] for row in tables_to_run]}")
-    elif set([x["OBJECT_NAME"] for x in active_df.collect()]).issubset(set(main_logged_today_tables)):
-        tables_to_run = []
-        print("All tables already processed today.")
+        tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_UPDATE") in failed_today_tables]
+        print(f"Retrying failed UPDATE tables only: {[row['OBJECT_NAME'] for row in tables_to_run]}")
     else:
-        tables_to_run = active_df.collect()
-        print("Running all active tables first time.")
+        processed_tables_today = set(main_logged_today_tables)
+        tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_UPDATE") not in processed_tables_today]
+        print(f"Running only pending UPDATE tables: {[row['OBJECT_NAME'] for row in tables_to_run]}")
+
 except Exception as e:
     print("No main log found — running all tables.")
     tables_to_run = active_df.collect()
@@ -176,26 +172,20 @@ tables_today = [row["table_name"] for row in daily_log_df.select("table_name").d
 cleaned_main_log_df = main_log_df.filter(~((col("load_date") == Today_date) & (col("table_name").isin(tables_today))))
 final_main_log_df = cleaned_main_log_df.unionByName(daily_log_df)
 
-# Save final main log
 temp_main_log_path = main_log_path + "_tmp"
 final_main_log_df.write.mode("overwrite").parquet(temp_main_log_path)
 
-# Replace files
-main_path = Path(main_log_path)
-temp_path = Path(temp_main_log_path)
-daily_path = Path(daily_log_path)
-
-if fs.exists(main_path):
-    fs.delete(main_path, True)
-fs.rename(temp_path, main_path)
-if fs.exists(daily_path):
-    fs.delete(daily_path, True)
+if fs.exists(Path(main_log_path)):
+    fs.delete(Path(main_log_path), True)
+fs.rename(Path(temp_main_log_path), Path(main_log_path))
+if fs.exists(Path(daily_log_path)):
+    fs.delete(Path(daily_log_path), True)
 
 print("✅ Main log updated and daily log cleaned.")
 
 # Recreate daily log if missing
 try:
-    if not fs.exists(daily_path):
+    if not fs.exists(Path(daily_log_path)):
         print("Daily log missing. Recreating daily log from main log schema...")
         main_log_df = spark.read.parquet(main_log_path)
         schema = main_log_df.schema
@@ -207,4 +197,4 @@ try:
 except Exception as final_error:
     print("❌ Final step error while checking/creating daily log:", final_error)
 
-print("✅ Update process with logging completed successfully!")
+print("✅ Update process with smart skip/retry completed successfully!")
