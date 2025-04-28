@@ -18,8 +18,10 @@ full_load_path = "Files/Bronze/STG/DSS_INC_FULL_LOAD_HISTORY_PM"
 staging_path = "Files/Bronze/STG"
 target_path = "Files/Bronze/TST"
 object_list_path = "Files/Bronze/COPY_TABLES/POC_TABLE_LIST"
-daily_log_path = "Files/Bronze/LOGS/STAGING_DAILY_INSERT_LOGS"
-main_log_path = "Files/Bronze/LOGS/STAGING_MAIN_INSERT_LOGS"
+
+# ✅ Correct Log Paths
+daily_log_path = "Files/Bronze/LOGS/STAGING_DAILY_LOGS"
+main_log_path = "Files/Bronze/LOGS/STAGING_MAIN_LOGS"
 
 # Load static datasets
 object_df = spark.read.parquet(object_list_path)
@@ -50,14 +52,12 @@ def list_folders(base_path):
                 folders.append(fileStatus.getPath().getName())
     return folders
 
-# Use new folder listing
 stg_folders = list_folders(staging_path)
 tst_folders = list_folders(target_path)
 
 # Thread-safe log writing
 log_write_lock = threading.Lock()
 
-# Helpers
 def get_actual_folder(base_list, table_name):
     for folder in base_list:
         if folder.lower() == table_name.lower():
@@ -104,7 +104,6 @@ def process_table(row_dict):
         except:
             target_df = spark.createDataFrame([], stg_df.schema)
 
-        # Correct timestamp logic
         filtered_full_df = full_load_df.filter(
             (col("UTCTimestamp") > max_ts) &
             (col("type") == "Insert") &
@@ -123,15 +122,15 @@ def process_table(row_dict):
 
         end_time = datetime.now()
         print(f"SUCCESS: {table_name}")
-        update_log(table_name, "SUCCESS", start_time, end_time)
+        update_log(table_name + "_INSERT", "SUCCESS", start_time, end_time)  # ✅ _INSERT added in log
 
     except Exception as e:
         end_time = datetime.now()
         error_message = traceback.format_exc()
         print(f"FAILURE for {table_name}: {e}")
-        update_log(table_name, "FAILURE", start_time, end_time, error_message)
+        update_log(table_name + "_INSERT", "FAILURE", start_time, end_time, error_message)  # ✅ _INSERT added in log
 
-# Decide which tables to run
+# ✅ Smarter decide which tables to run for INSERT
 try:
     main_log_df = spark.read.parquet(main_log_path)
     failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
@@ -139,15 +138,21 @@ try:
     main_logged_today_tables = main_log_df.filter(f"load_date = '{Today_date}'") \
         .select("table_name").distinct().rdd.flatMap(lambda x: x).collect()
 
+    all_active_tables = [item for item in active_df.collect()]
+
     if failed_today_tables:
-        tables_to_run = [item for item in active_df.collect() if item["OBJECT_NAME"] in failed_today_tables]
-        print(f"Retrying only failed tables: {[row['OBJECT_NAME'] for row in tables_to_run]}")
-    elif set([x["OBJECT_NAME"] for x in active_df.collect()]).issubset(set(main_logged_today_tables)):
-        tables_to_run = []
-        print("All tables already processed today.")
+        # Retry only failed _INSERT tables
+        tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_INSERT") in failed_today_tables]
+        print(f"Retrying failed INSERT tables only: {[row['OBJECT_NAME'] for row in tables_to_run]}")
     else:
-        tables_to_run = active_df.collect()
-        print("Running all active tables first time.")
+        # Skip already processed _INSERT tables
+        processed_tables_today = set(main_logged_today_tables)
+        tables_to_run = [item for item in all_active_tables if (item["OBJECT_NAME"] + "_INSERT") not in processed_tables_today]
+        if tables_to_run:
+            print(f"Running only pending INSERT tables: {[row['OBJECT_NAME'] for row in tables_to_run]}")
+        else:
+            print("✅ All INSERT tables are already processed today. No action needed.")
+
 except Exception as e:
     print("No main log found — running all tables.")
     tables_to_run = active_df.collect()
@@ -203,4 +208,4 @@ try:
 except Exception as final_error:
     print("❌ Final step error while checking/creating daily log:", final_error)
 
-print("✅ Insert process with logging completed successfully!")
+print("✅ Insert process with smart skip/retry completed successfully!")
