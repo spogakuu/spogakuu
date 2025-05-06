@@ -1,20 +1,21 @@
 SELECT 
-    srh.registered_entity_id,
     srh.effective_dt,
     srh.ISIN_fs_equity_isin AS isin_value,
-    ten.registered_entity_id AS tradable_registered_entity_id,
+    srh.registered_entity_id,
+    srh.PRIMARY_RECORD AS srh_primary_record,
+    ten.global_exchange_designation_cd AS tradable_primary_flag,
     ten.creation_dt,
     ten.deactivation_dt
 FROM ISIN_PUBLIC_ATTR_ALT srh
 JOIN AM_DL_RAW_CDE.CD_SEC_REF_TRADABLE_ENT_AUTO ten
   ON srh.registered_entity_id = ten.registered_entity_id
- AND srh.effective_dt BETWEEN ten.creation_dt AND COALESCE(ten.deactivation_dt, DATE '9999-12-31')
 WHERE srh.PRIMARY_RECORD = 'Y'
-  AND (srh.registered_entity_id, srh.effective_dt) IN (
-      SELECT registered_entity_id, effective_dt
+  AND ten.global_exchange_designation_cd = 'P'
+  AND srh.ISIN_fs_equity_isin IN (
+      SELECT ISIN_fs_equity_isin
       FROM ISIN_PUBLIC_ATTR_ALT
       WHERE PRIMARY_RECORD = 'Y'
-      GROUP BY registered_entity_id, effective_dt
-      HAVING COUNT(*) > 1
+      GROUP BY ISIN_fs_equity_isin
+      HAVING COUNT(DISTINCT registered_entity_id) > 1
   )
-ORDER BY srh.registered_entity_id, srh.effective_dt;
+ORDER BY srh.ISIN_fs_equity_isin, srh.effective_dt, srh.registered_entity_id;
