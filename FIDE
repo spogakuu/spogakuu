@@ -1,4 +1,3 @@
-CREATE OR REPLACE TABLE ISIN_DUPLICATE_ANALYSIS AS
 SELECT 
     srh.registered_entity_id,
     srh.effective_dt,
@@ -17,4 +16,5 @@ WHERE srh.PRIMARY_RECORD = 'Y'
       WHERE PRIMARY_RECORD = 'Y'
       GROUP BY registered_entity_id, effective_dt
       HAVING COUNT(*) > 1
-  );
+  )
+ORDER BY srh.registered_entity_id, srh.effective_dt;
