@@ -1,21 +1,45 @@
-SELECT 
-    srh.effective_dt,
-    srh.ISIN_fs_equity_isin AS isin_value,
-    srh.registered_entity_id,
-    srh.PRIMARY_RECORD AS srh_primary_record,
-    ten.global_exchange_designation_cd AS tradable_primary_flag,
-    ten.creation_dt,
-    ten.deactivation_dt
-FROM ISIN_PUBLIC_ATTR_ALT srh
-JOIN AM_DL_RAW_CDE.CD_SEC_REF_TRADABLE_ENT_AUTO ten
-  ON srh.registered_entity_id = ten.registered_entity_id
-WHERE srh.PRIMARY_RECORD = 'Y'
-  AND ten.global_exchange_designation_cd = 'P'
-  AND srh.ISIN_fs_equity_isin IN (
-      SELECT ISIN_fs_equity_isin
-      FROM ISIN_PUBLIC_ATTR_ALT
-      WHERE PRIMARY_RECORD = 'Y'
-      GROUP BY ISIN_fs_equity_isin
-      HAVING COUNT(DISTINCT registered_entity_id) > 1
-  )
-ORDER BY srh.ISIN_fs_equity_isin, srh.effective_dt, srh.registered_entity_id;
+CREATE OR REPLACE TRANSIENT TABLE ISIN_PUBLIC_ATTR_ALT AS
+WITH ranked_data AS (
+    SELECT DISTINCT
+        srh_1.registered_entity_id,
+        srh_1.effective_dt,
+        srh_2.registered_entity_id AS ISIN_registered_entity_id,
+        srh_2.ISSUER_BUS_ENT_ID AS ISIN_PUBLIC_ISSUER_BUS_ENT_ID,
+        srh_2.ISSUER_BUS_ENT_TYPE_CD AS ISIN_PUBLIC_ISSUER_BUS_ENT_TYPE_CD,
+        srh_2.ISSUER_BUS_ENT_SHORT_DESC AS ISIN_PUBLIC_ISSUER_BUS_ENT_SHORT_DESC,
+        srh_2.ISSUER_BUS_ENT_LONG_DESC AS ISIN_PUBLIC_ISSUER_BUS_ENT_LONG_DESC,
+        srh_2.ISSUER_BUS_ENT_TYPE_DESC AS ISIN_PUBLIC_ISSUER_BUS_ENT_TYPE_DESC,
+        srh_2.ISSUER_BUS_ENT_FMR_ID AS ISIN_PUBLIC_ISSUER_BUS_ENT_FMR_ID,
+        srh_2.ISSUER_CUSIP AS ISIN_PUBLIC_ISSUER_CUSIP,
+        srh_1.fs_equity_cusip AS ISIN_fs_equity_cusip,
+        srh_1.fs_equity_isin AS ISIN_fs_equity_isin,
+        srh_1.FACSET_EQUITY_SEDOL AS ISIN_FACSET_EQUITY_SEDOL,
+        CASE 
+            WHEN ten.REGISTERED_ENTITY_ID IS NOT NULL THEN 'Y'
+            ELSE 'N'
+        END AS PRIMARY_RECORD,
+        ten.CREATION_DT AS TRADE_CREATION_DT,
+        ten.DEACTIVATION_DT AS TRADE_DEACTV_DT,
+        ROW_NUMBER() OVER (
+            PARTITION BY srh_1.registered_entity_id, srh_1.effective_dt
+            ORDER BY ten.CREATION_DT DESC
+        ) AS rn
+    FROM SRH_PUB_ISS_PERF_ALT srh_1
+    JOIN SRH_PUB_ISS_PERF_ALT srh_2
+        ON srh_1.fs_equity_isin = srh_2.ISIN
+        AND srh_1.effective_dt = srh_2.effective_dt
+        AND srh_2.global_exchange_designation_cd = 'p'
+    LEFT JOIN AM_DL_RAW_CDE.CD_SEC_REF_TRADABLE_ENT_AUTO ten
+        ON srh_2.REGISTERED_ENTITY_ID = ten.REGISTERED_ENTITY_ID
+        AND ten.global_exchange_designation_cd = 'p'
+        AND srh_1.effective_dt BETWEEN ten.CREATION_DT AND NVL(ten.DEACTIVATION_DT, DATE '9999-12-31')
+        AND ten.SOURCE_DELETED_FLAG IS NULL
+)
+
+SELECT *,
+    CASE 
+        WHEN rn = 1 THEN 'Latest based on creation date'
+        ELSE 'Duplicate - Not latest'
+    END AS COMMENTS
+FROM ranked_data
+WHERE rn = 1;
