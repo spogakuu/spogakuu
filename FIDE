@@ -1,10 +1,9 @@
--- Step 2: Extract all object references (up to 100 per proc)
 CREATE OR REPLACE TEMP TABLE amwh_object_references AS
 SELECT 
     mp.procedure_catalog,
     mp.procedure_schema,
     mp.procedure_name,
-    REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, g.seq) AS referenced_object
+    REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+(?:\\.\\w+)?', 1, g.seq + 1) AS referenced_object
 FROM matched_procedures mp,
      LATERAL (SELECT SEQ4() AS seq FROM TABLE(GENERATOR(ROWCOUNT => 100))) g
-WHERE REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, g.seq) IS NOT NULL;
+WHERE REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+(?:\\.\\w+)?', 1, g.seq + 1) IS NOT NULL;
