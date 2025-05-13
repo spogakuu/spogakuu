@@ -1,28 +1,28 @@
--- Step 1: Identify procedures that reference am_dl_raw_amwh
+-- Step 1: Find procedures referencing am_dl_raw_amwh
 CREATE OR REPLACE TEMP TABLE matched_procedures AS
 SELECT 
     procedure_catalog,
     procedure_schema,
     procedure_name,
-    LOWER(procedure_definition) AS procedure_definition -- normalize for case-insensitive search
+    LOWER(procedure_definition) AS procedure_definition
 FROM snowflake.account_usage.procedures
 WHERE deleted IS NULL
   AND procedure_catalog = 'AM_DL_CUR_Q_QRI'
   AND procedure_schema IN ('QDATA', 'QMETA', 'OPERATIONS')
   AND procedure_definition ILIKE '%am_dl_raw_amwh.%';
 
--- Step 2: Explode multiple references (approx. workaround using repeated substrings)
+-- Step 2: Extract all object references (up to 100 per proc)
 CREATE OR REPLACE TEMP TABLE amwh_object_references AS
 SELECT 
-    procedure_catalog,
-    procedure_schema,
-    procedure_name,
-    regexp_substr(procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, seq) AS referenced_object
-FROM matched_procedures,
-     TABLE(GENERATOR(ROWCOUNT => 100)) AS seq_table(seq) -- attempt to extract up to 100 matches
-WHERE regexp_substr(procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, seq) IS NOT NULL;
+    mp.procedure_catalog,
+    mp.procedure_schema,
+    mp.procedure_name,
+    REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, seq.seq) AS referenced_object
+FROM matched_procedures mp,
+     LATERAL (SELECT SEQ4() AS seq FROM TABLE(GENERATOR(ROWCOUNT => 100))) AS seq
+WHERE REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, seq.seq) IS NOT NULL;
 
--- Step 3: Deduplicate per procedure-object pair
+-- Step 3: Deduplicate object references per procedure
 CREATE OR REPLACE TEMP TABLE final_references AS
 SELECT DISTINCT
     procedure_catalog,
