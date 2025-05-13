@@ -1,9 +1,30 @@
-CREATE OR REPLACE TEMP TABLE amwh_object_references AS
+-- 3-part match
+CREATE OR REPLACE TEMP TABLE ref_3_part AS
 SELECT 
     mp.procedure_catalog,
     mp.procedure_schema,
     mp.procedure_name,
-    REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+(?:\\.\\w+)?', 1, g.seq + 1) AS referenced_object
+    REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, g.seq + 1) AS referenced_object
 FROM matched_procedures mp,
      LATERAL (SELECT SEQ4() AS seq FROM TABLE(GENERATOR(ROWCOUNT => 100))) g
-WHERE REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+(?:\\.\\w+)?', 1, g.seq + 1) IS NOT NULL;
+WHERE REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, g.seq + 1) IS NOT NULL;
+
+-- 2-part match
+CREATE OR REPLACE TEMP TABLE ref_2_part AS
+SELECT 
+    mp.procedure_catalog,
+    mp.procedure_schema,
+    mp.procedure_name,
+    REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+', 1, g.seq + 1) AS referenced_object
+FROM matched_procedures mp,
+     LATERAL (SELECT SEQ4() AS seq FROM TABLE(GENERATOR(ROWCOUNT => 100))) g
+WHERE REGEXP_SUBSTR(mp.procedure_definition, 'am_dl_raw_amwh\\.\w+', 1, g.seq + 1) IS NOT NULL;
+
+-- Combine and deduplicate
+CREATE OR REPLACE TEMP TABLE final_references AS
+SELECT DISTINCT * FROM ref_3_part
+UNION
+SELECT DISTINCT * FROM ref_2_part;
+
+-- View results
+SELECT * FROM final_references;
