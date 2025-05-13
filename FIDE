@@ -1,44 +1,35 @@
--- Step 1: Identify procedures that reference the am_dl_raw_amwh database
+-- Step 1: Identify procedures that reference am_dl_raw_amwh
 CREATE OR REPLACE TEMP TABLE matched_procedures AS
 SELECT 
     procedure_catalog,
     procedure_schema,
     procedure_name,
-    procedure_definition
+    LOWER(procedure_definition) AS procedure_definition -- normalize for case-insensitive search
 FROM snowflake.account_usage.procedures
 WHERE deleted IS NULL
   AND procedure_catalog = 'AM_DL_CUR_Q_QRI'
   AND procedure_schema IN ('QDATA', 'QMETA', 'OPERATIONS')
   AND procedure_definition ILIKE '%am_dl_raw_amwh.%';
 
--- Step 2: Extract raw reference strings from the procedure definition
-CREATE OR REPLACE TEMP TABLE amwh_objects AS
+-- Step 2: Explode multiple references (approx. workaround using repeated substrings)
+CREATE OR REPLACE TEMP TABLE amwh_object_references AS
 SELECT 
     procedure_catalog,
     procedure_schema,
     procedure_name,
-    TRIM(SUBSTRING(procedure_definition, 
-        POSITION('am_dl_raw_amwh.' IN procedure_definition), 
-        150)) AS raw_ref
-FROM matched_procedures;
+    regexp_substr(procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, seq) AS referenced_object
+FROM matched_procedures,
+     TABLE(GENERATOR(ROWCOUNT => 100)) AS seq_table(seq) -- attempt to extract up to 100 matches
+WHERE regexp_substr(procedure_definition, 'am_dl_raw_amwh\\.\w+\\.\w+', 1, seq) IS NOT NULL;
 
--- Step 3: Clean the object references (remove trailing characters)
+-- Step 3: Deduplicate per procedure-object pair
 CREATE OR REPLACE TEMP TABLE final_references AS
 SELECT DISTINCT
     procedure_catalog,
     procedure_schema,
     procedure_name,
-    CASE 
-        WHEN POSITION(' ' IN raw_ref) > 0 THEN 
-            LEFT(raw_ref, POSITION(' ' IN raw_ref) - 1)
-        WHEN POSITION(';' IN raw_ref) > 0 THEN 
-            LEFT(raw_ref, POSITION(';' IN raw_ref) - 1)
-        WHEN POSITION(')' IN raw_ref) > 0 THEN 
-            LEFT(raw_ref, POSITION(')' IN raw_ref) - 1)
-        ELSE raw_ref
-    END AS referenced_object
-FROM amwh_objects
-WHERE raw_ref ILIKE 'am_dl_raw_amwh.%';
+    referenced_object
+FROM amwh_object_references;
 
 -- Step 4: View results
 SELECT * FROM final_references;
