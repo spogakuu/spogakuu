@@ -11,48 +11,40 @@ SET
   is_isin  = isin_registered_entity_id  IS NOT NULL,
   is_cusip = cusip_registered_entity_id IS NOT NULL;
 
+CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
 
-
-WITH to_update AS (
+WITH updates AS (
   SELECT
     tgt.registered_entity_id,
     tgt.effective_dt,
 
-    -- old vs new values
-    tgt.public_registered_entity_id   AS old_pub_reg_ent_id,
-    src.public_registered_entity_id   AS new_pub_reg_ent_id,
+    -- old vs. new values
+    tgt.public_registered_entity_id       AS old_pub_reg_ent_id,
+    src.public_registered_entity_id       AS new_pub_reg_ent_id,
+    tgt.public_issuer_bus_ent_id          AS old_pub_bus_ent_id,
+    src.public_issuer_bus_ent_id          AS new_pub_bus_ent_id,
+    tgt.public_issuer_bus_ent_type_cd     AS old_pub_bus_ent_type_cd,
+    src.public_issuer_bus_ent_type_cd     AS new_pub_bus_ent_type_cd,
+    tgt.public_issuer_bus_ent_short_desc  AS old_pub_bus_ent_short_desc,
+    src.public_issuer_bus_ent_short_desc  AS new_pub_bus_ent_short_desc,
+    tgt.public_issuer_bus_ent_long_desc   AS old_pub_bus_ent_long_desc,
+    src.public_issuer_bus_ent_long_desc   AS new_pub_bus_ent_long_desc,
+    tgt.public_issuer_bus_ent_fmr_id      AS old_pub_bus_ent_fmr_id,
+    src.public_issuer_bus_ent_fmr_id      AS new_pub_bus_ent_fmr_id,
+    tgt.public_issuer_cusip               AS old_pub_issuer_cusip,
+    src.public_issuer_cusip               AS new_pub_issuer_cusip,
+    tgt.public_equity_cusip               AS old_pub_equity_cusip,
+    src.public_equity_cusip               AS new_pub_equity_cusip,
+    tgt.public_equity_isin                AS old_pub_equity_isin,
+    src.public_equity_isin                AS new_pub_equity_isin,
 
-    tgt.public_issuer_bus_ent_id      AS old_pub_bus_ent_id,
-    src.public_issuer_bus_ent_id      AS new_pub_bus_ent_id,
-
-    tgt.public_issuer_bus_ent_type_cd AS old_pub_bus_ent_type_cd,
-    src.public_issuer_bus_ent_type_cd AS new_pub_bus_ent_type_cd,
-
-    tgt.public_issuer_bus_ent_short_desc AS old_pub_bus_ent_short_desc,
-    src.public_issuer_bus_ent_short_desc AS new_pub_bus_ent_short_desc,
-
-    tgt.public_issuer_bus_ent_long_desc  AS old_pub_bus_ent_long_desc,
-    src.public_issuer_bus_ent_long_desc  AS new_pub_bus_ent_long_desc,
-
-    tgt.public_issuer_bus_ent_fmr_id     AS old_pub_bus_ent_fmr_id,
-    src.public_issuer_bus_ent_fmr_id     AS new_pub_bus_ent_fmr_id,
-
-    tgt.public_issuer_cusip              AS old_pub_issuer_cusip,
-    src.public_issuer_cusip              AS new_pub_issuer_cusip,
-
-    tgt.public_equity_cusip              AS old_pub_equity_cusip,
-    src.public_equity_cusip              AS new_pub_equity_cusip,
-
-    tgt.public_equity_isin               AS old_pub_equity_isin,
-    src.public_equity_isin               AS new_pub_equity_isin,
-
-    -- vendor flags (you should have populated these already; if not, see notes below)
+    -- vendor flags (pre-computed on src)
     src.is_kmk,
     src.is_sdl,
     src.is_isin,
     src.is_cusip,
 
-    -- pick exactly one vendor category
+    -- pick a single category
     CASE
       WHEN src.is_kmk   THEN 'KMK'
       WHEN src.is_sdl   THEN 'SDL'
@@ -61,29 +53,31 @@ WITH to_update AS (
       ELSE               'UNKNOWN'
     END AS category_used,
 
-    -- build a pipe-delimited list of exactly which columns changed
+    -- which columns actually changed?
     ARRAY_TO_STRING(
-      ARRAY_CONSTRUCT(
-        IFF(src.public_registered_entity_id   <> tgt.public_registered_entity_id,   'PUBLIC_REGISTERED_ENTITY_ID',    NULL),
-        IFF(src.public_issuer_bus_ent_id      <> tgt.public_issuer_bus_ent_id,      'PUBLIC_ISSUER_BUS_ENT_ID',       NULL),
-        IFF(src.public_issuer_bus_ent_type_cd <> tgt.public_issuer_bus_ent_type_cd, 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD',  NULL),
-        IFF(src.public_issuer_bus_ent_short_desc <> tgt.public_issuer_bus_ent_short_desc, 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC', NULL),
-        IFF(src.public_issuer_bus_ent_long_desc  <> tgt.public_issuer_bus_ent_long_desc,  'PUBLIC_ISSUER_BUS_ENT_LONG_DESC',  NULL),
-        IFF(src.public_issuer_bus_ent_fmr_id     <> tgt.public_issuer_bus_ent_fmr_id,     'PUBLIC_ISSUER_BUS_ENT_FMR_ID',     NULL),
-        IFF(src.public_issuer_cusip              <> tgt.public_issuer_cusip,              'PUBLIC_ISSUER_CUSIP',             NULL),
-        IFF(src.public_equity_cusip              <> tgt.public_equity_cusip,              'PUBLIC_EQUITY_CUSIP',             NULL),
-        IFF(src.public_equity_isin               <> tgt.public_equity_isin,               'PUBLIC_EQUITY_ISIN',              NULL)
+      ARRAY_COMPACT(
+        ARRAY_CONSTRUCT(
+          IFF(src.public_registered_entity_id   <> tgt.public_registered_entity_id,   'PUBLIC_REGISTERED_ENTITY_ID',    NULL),
+          IFF(src.public_issuer_bus_ent_id      <> tgt.public_issuer_bus_ent_id,      'PUBLIC_ISSUER_BUS_ENT_ID',       NULL),
+          IFF(src.public_issuer_bus_ent_type_cd <> tgt.public_issuer_bus_ent_type_cd, 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD',  NULL),
+          IFF(src.public_issuer_bus_ent_short_desc <> tgt.public_issuer_bus_ent_short_desc, 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC', NULL),
+          IFF(src.public_issuer_bus_ent_long_desc  <> tgt.public_issuer_bus_ent_long_desc,  'PUBLIC_ISSUER_BUS_ENT_LONG_DESC',  NULL),
+          IFF(src.public_issuer_bus_ent_fmr_id     <> tgt.public_issuer_bus_ent_fmr_id,     'PUBLIC_ISSUER_BUS_ENT_FMR_ID',     NULL),
+          IFF(src.public_issuer_cusip              <> tgt.public_issuer_cusip,              'PUBLIC_ISSUER_CUSIP',             NULL),
+          IFF(src.public_equity_cusip              <> tgt.public_equity_cusip,              'PUBLIC_EQUITY_CUSIP',             NULL),
+          IFF(src.public_equity_isin               <> tgt.public_equity_isin,               'PUBLIC_EQUITY_ISIN',              NULL)
+        )
       ),
       '|'
     ) AS fields_changed
 
-  FROM SECURITY_REFERENCE_HISTORY_BASE tgt
-  JOIN PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT src
+  FROM SECURITY_REFERENCE_HISTORY_BASE  AS tgt
+  JOIN PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT AS src
     ON tgt.registered_entity_id = src.registered_entity_id
    AND tgt.effective_dt         = src.effective_dt
 
-  -- only rows where something actually changed
-  WHERE src.md5_src <> tgt.md5_tgt
+  -- now comparing the two MD5 columns in the src table itself
+  WHERE src.md5_src <> src.md5_tgt
 )
 
 SELECT
@@ -92,16 +86,16 @@ SELECT
   category_used,
   fields_changed,
 
-  -- pull through old/new for easy review
-  old_pub_reg_ent_id, new_pub_reg_ent_id,
-  old_pub_bus_ent_id, new_pub_bus_ent_id,
+  old_pub_reg_ent_id,   new_pub_reg_ent_id,
+  old_pub_bus_ent_id,   new_pub_bus_ent_id,
   old_pub_bus_ent_type_cd, new_pub_bus_ent_type_cd,
   old_pub_bus_ent_short_desc, new_pub_bus_ent_short_desc,
-  old_pub_bus_ent_long_desc, new_pub_bus_ent_long_desc,
-  old_pub_bus_ent_fmr_id, new_pub_bus_ent_fmr_id,
-  old_pub_issuer_cusip, new_pub_issuer_cusip,
-  old_pub_equity_cusip, new_pub_equity_cusip,
-  old_pub_equity_isin,  new_pub_equity_isin
+  old_pub_bus_ent_long_desc,  new_pub_bus_ent_long_desc,
+  old_pub_bus_ent_fmr_id,     new_pub_bus_ent_fmr_id,
+  old_pub_issuer_cusip,       new_pub_issuer_cusip,
+  old_pub_equity_cusip,       new_pub_equity_cusip,
+  old_pub_equity_isin,        new_pub_equity_isin
 
-FROM to_update
+FROM updates
 ORDER BY registered_entity_id, effective_dt;
+
