@@ -141,3 +141,19 @@ WHERE fields_changed IS NOT NULL
 ORDER BY registered_entity_id, effective_dt;
 
 
+
+SELECT
+  COUNT(*) AS total_rows,
+  SUM(CASE WHEN md5_src = md5_tgt THEN 1 ELSE 0 END) AS equal_hashes,
+  SUM(CASE WHEN md5_src <> md5_tgt THEN 1 ELSE 0 END) AS unequal_hashes
+FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT;
+
+
+
+-- How many src rows have a matching tgt?
+SELECT COUNT(*) FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT src
+LEFT JOIN SECURITY_REFERENCE_HISTORY_BASE tgt
+  ON src.registered_entity_id = tgt.registered_entity_id
+ AND src.effective_dt         = tgt.effective_dt
+WHERE tgt.registered_entity_id IS NOT NULL;
+
