@@ -1,92 +1,34 @@
-WITH audit AS (
-  SELECT
-    src.registered_entity_id,
-    src.effective_dt,
-
-    -- old vs. new for display
-    tgt.public_registered_entity_id   AS old_pub_reg_ent_id,
-    src.public_registered_entity_id   AS new_pub_reg_ent_id,
-    tgt.public_issuer_bus_ent_id      AS old_pub_bus_ent_id,
-    src.public_issuer_bus_ent_id      AS new_pub_bus_ent_id,
-    tgt.public_issuer_bus_ent_type_cd AS old_pub_bus_ent_type_cd,
-    src.public_issuer_bus_ent_type_cd AS new_pub_bus_ent_type_cd,
-    tgt.public_issuer_bus_ent_short_desc AS old_pub_bus_ent_short_desc,
-    src.public_issuer_bus_ent_short_desc AS new_pub_bus_ent_short_desc,
-    tgt.public_issuer_bus_ent_long_desc  AS old_pub_bus_ent_long_desc,
-    src.public_issuer_bus_ent_long_desc  AS new_pub_bus_ent_long_desc,
-    tgt.public_issuer_bus_ent_fmr_id     AS old_pub_bus_ent_fmr_id,
-    src.public_issuer_bus_ent_fmr_id     AS new_pub_bus_ent_fmr_id,
-    tgt.public_issuer_cusip              AS old_pub_issuer_cusip,
-    src.public_issuer_cusip              AS new_pub_issuer_cusip,
-    tgt.public_equity_cusip              AS old_pub_equity_cusip,
-    src.public_equity_cusip              AS new_pub_equity_cusip,
-    tgt.public_equity_isin               AS old_pub_equity_isin,
-    src.public_equity_isin               AS new_pub_equity_isin,
-
-    -- single category
-    CASE
-      WHEN src.is_kmk   THEN 'KMK'
-      WHEN src.is_sdl   THEN 'SDL'
-      WHEN src.is_isin  THEN 'ISIN'
-      WHEN src.is_cusip THEN 'CUSIP'
-      ELSE               'UNKNOWN'
-    END AS category_used,
-
-    -- null-safe diff detection via NVL()
-    CONCAT_WS('|',
-      CASE WHEN NVL(src.public_registered_entity_id, -1)
-             <> NVL(tgt.public_registered_entity_id, -1)
-           THEN 'PUBLIC_REGISTERED_ENTITY_ID' END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_id, -1)
-             <> NVL(tgt.public_issuer_bus_ent_id, -1)
-           THEN 'PUBLIC_ISSUER_BUS_ENT_ID' END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_type_cd, 'NA')
-             <> NVL(tgt.public_issuer_bus_ent_type_cd, 'NA')
-           THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD' END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_short_desc, 'NA')
-             <> NVL(tgt.public_issuer_bus_ent_short_desc, 'NA')
-           THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC' END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_long_desc, 'NA')
-             <> NVL(tgt.public_issuer_bus_ent_long_desc, 'NA')
-           THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC' END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_fmr_id, 'NA')
-             <> NVL(tgt.public_issuer_bus_ent_fmr_id, 'NA')
-           THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID' END,
-      CASE WHEN NVL(src.public_issuer_cusip, 'NA')
-             <> NVL(tgt.public_issuer_cusip, 'NA')
-           THEN 'PUBLIC_ISSUER_CUSIP' END,
-      CASE WHEN NVL(src.public_equity_cusip, 'NA')
-             <> NVL(tgt.public_equity_cusip, 'NA')
-           THEN 'PUBLIC_EQUITY_CUSIP' END,
-      CASE WHEN NVL(src.public_equity_isin, 'NA')
-             <> NVL(tgt.public_equity_isin, 'NA')
-           THEN 'PUBLIC_EQUITY_ISIN' END
-    ) AS fields_changed
-
-  FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT src
-  JOIN SECURITY_REFERENCE_HISTORY_BASE   tgt
-    ON src.registered_entity_id = tgt.registered_entity_id
-   AND src.effective_dt         = tgt.effective_dt
-
-  WHERE src.md5_src <> src.md5_tgt
-)
-
 SELECT
-  registered_entity_id,
-  effective_dt,
-  category_used,
-  fields_changed,
-  old_pub_reg_ent_id,   new_pub_reg_ent_id,
-  old_pub_bus_ent_id,   new_pub_bus_ent_id,
-  old_pub_bus_ent_type_cd, new_pub_bus_ent_type_cd,
-  old_pub_bus_ent_short_desc, new_pub_bus_ent_short_desc,
-  old_pub_bus_ent_long_desc, new_pub_bus_ent_long_desc,
-  old_pub_bus_ent_fmr_id, new_pub_bus_ent_fmr_id,
-  old_pub_issuer_cusip, new_pub_issuer_cusip,
-  old_pub_equity_cusip, new_pub_equity_cusip,
-  old_pub_equity_isin,  new_pub_equity_isin
+  srh.registered_entity_id,
+  srh.effective_dt,
+  srh.md5_src,
+  srh.md5_tgt,
 
-FROM audit
-WHERE fields_changed IS NOT NULL
-  AND fields_changed <> ''
-ORDER BY registered_entity_id, effective_dt;
+  -- new (incoming) values
+  srh.public_registered_entity_id   AS new_pub_reg_ent_id,
+  srh.public_issuer_bus_ent_id      AS new_pub_bus_ent_id,
+  srh.public_issuer_bus_ent_type_cd AS new_pub_bus_ent_type_cd,
+  srh.public_issuer_bus_ent_short_desc AS new_pub_bus_ent_short_desc,
+  srh.public_issuer_bus_ent_long_desc  AS new_pub_bus_ent_long_desc,
+  srh.public_issuer_bus_ent_fmr_id     AS new_pub_bus_ent_fmr_id,
+  srh.public_issuer_cusip              AS new_pub_issuer_cusip,
+  srh.public_equity_cusip              AS new_pub_equity_cusip,
+  srh.public_equity_isin               AS new_pub_equity_isin,
+
+  -- old (prod) values
+  hist.public_registered_entity_id   AS old_pub_reg_ent_id,
+  hist.public_issuer_bus_ent_id      AS old_pub_bus_ent_id,
+  hist.public_issuer_bus_ent_type_cd AS old_pub_bus_ent_type_cd,
+  hist.public_issuer_bus_ent_short_desc AS old_pub_bus_ent_short_desc,
+  hist.public_issuer_bus_ent_long_desc  AS old_pub_bus_ent_long_desc,
+  hist.public_issuer_bus_ent_fmr_id     AS old_pub_bus_ent_fmr_id,
+  hist.public_issuer_cusip              AS old_pub_issuer_cusip,
+  hist.public_equity_cusip              AS old_pub_equity_cusip,
+  hist.public_equity_isin               AS old_pub_equity_isin
+
+FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT AS srh
+JOIN SECURITY_REFERENCE_HISTORY_BASE    AS hist
+  ON srh.registered_entity_id = hist.registered_entity_id
+ AND srh.effective_dt         = hist.effective_dt
+WHERE srh.md5_src <> srh.md5_tgt
+ORDER BY srh.registered_entity_id, srh.effective_dt;
