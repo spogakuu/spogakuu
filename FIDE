@@ -12,6 +12,7 @@ SET
   is_cusip = cusip_registered_entity_id IS NOT NULL;
 
 CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
+CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
 
 WITH updates AS (
   SELECT
@@ -53,30 +54,31 @@ WITH updates AS (
       ELSE               'UNKNOWN'
     END AS category_used,
 
-    -- which columns actually changed?
-    ARRAY_TO_STRING(
-      ARRAY_COMPACT(
-        ARRAY_CONSTRUCT(
-          IFF(src.public_registered_entity_id   <> tgt.public_registered_entity_id,   'PUBLIC_REGISTERED_ENTITY_ID',    NULL),
-          IFF(src.public_issuer_bus_ent_id      <> tgt.public_issuer_bus_ent_id,      'PUBLIC_ISSUER_BUS_ENT_ID',       NULL),
-          IFF(src.public_issuer_bus_ent_type_cd <> tgt.public_issuer_bus_ent_type_cd, 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD',  NULL),
-          IFF(src.public_issuer_bus_ent_short_desc <> tgt.public_issuer_bus_ent_short_desc, 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC', NULL),
-          IFF(src.public_issuer_bus_ent_long_desc  <> tgt.public_issuer_bus_ent_long_desc,  'PUBLIC_ISSUER_BUS_ENT_LONG_DESC',  NULL),
-          IFF(src.public_issuer_bus_ent_fmr_id     <> tgt.public_issuer_bus_ent_fmr_id,     'PUBLIC_ISSUER_BUS_ENT_FMR_ID',     NULL),
-          IFF(src.public_issuer_cusip              <> tgt.public_issuer_cusip,              'PUBLIC_ISSUER_CUSIP',             NULL),
-          IFF(src.public_equity_cusip              <> tgt.public_equity_cusip,              'PUBLIC_EQUITY_CUSIP',             NULL),
-          IFF(src.public_equity_isin               <> tgt.public_equity_isin,               'PUBLIC_EQUITY_ISIN',              NULL)
-        )
-      ),
-      '|'
+    -- build a pipe-delimited list of exactly which columns changed
+    CONCAT_WS('|',
+      CASE WHEN src.public_registered_entity_id    <> tgt.public_registered_entity_id    THEN 'PUBLIC_REGISTERED_ENTITY_ID'    END,
+      CASE WHEN src.public_issuer_bus_ent_id       <> tgt.public_issuer_bus_ent_id       THEN 'PUBLIC_ISSUER_BUS_ENT_ID'       END,
+      CASE WHEN src.public_issuer_bus_ent_type_cd  <> tgt.public_issuer_bus_ent_type_cd  THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD'  END,
+      CASE WHEN src.public_issuer_bus_ent_short_desc <> tgt.public_issuer_bus_ent_short_desc 
+           THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC' END,
+      CASE WHEN src.public_issuer_bus_ent_long_desc  <> tgt.public_issuer_bus_ent_long_desc  
+           THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC'  END,
+      CASE WHEN src.public_issuer_bus_ent_fmr_id     <> tgt.public_issuer_bus_ent_fmr_id     
+           THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID'     END,
+      CASE WHEN src.public_issuer_cusip              <> tgt.public_issuer_cusip              
+           THEN 'PUBLIC_ISSUER_CUSIP'             END,
+      CASE WHEN src.public_equity_cusip              <> tgt.public_equity_cusip              
+           THEN 'PUBLIC_EQUITY_CUSIP'             END,
+      CASE WHEN src.public_equity_isin               <> tgt.public_equity_isin               
+           THEN 'PUBLIC_EQUITY_ISIN'              END
     ) AS fields_changed
 
-  FROM SECURITY_REFERENCE_HISTORY_BASE  AS tgt
+  FROM SECURITY_REFERENCE_HISTORY_BASE AS tgt
   JOIN PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT AS src
     ON tgt.registered_entity_id = src.registered_entity_id
    AND tgt.effective_dt         = src.effective_dt
 
-  -- now comparing the two MD5 columns in the src table itself
+  -- compare two MD5 hashes stored in the src table
   WHERE src.md5_src <> src.md5_tgt
 )
 
@@ -86,8 +88,8 @@ SELECT
   category_used,
   fields_changed,
 
-  old_pub_reg_ent_id,   new_pub_reg_ent_id,
-  old_pub_bus_ent_id,   new_pub_bus_ent_id,
+  old_pub_reg_ent_id,     new_pub_reg_ent_id,
+  old_pub_bus_ent_id,     new_pub_bus_ent_id,
   old_pub_bus_ent_type_cd, new_pub_bus_ent_type_cd,
   old_pub_bus_ent_short_desc, new_pub_bus_ent_short_desc,
   old_pub_bus_ent_long_desc,  new_pub_bus_ent_long_desc,
