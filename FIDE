@@ -17,38 +17,55 @@ CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
 
 CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
 
+CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
+
 WITH updates AS (
   SELECT
+    -- key columns (never NULL)
     tgt.registered_entity_id,
     tgt.effective_dt,
 
-    -- old vs. new values
-    tgt.public_registered_entity_id       AS old_pub_reg_ent_id,
-    src.public_registered_entity_id       AS new_pub_reg_ent_id,
-    tgt.public_issuer_bus_ent_id          AS old_pub_bus_ent_id,
-    src.public_issuer_bus_ent_id          AS new_pub_bus_ent_id,
-    tgt.public_issuer_bus_ent_type_cd     AS old_pub_bus_ent_type_cd,
-    src.public_issuer_bus_ent_type_cd     AS new_pub_bus_ent_type_cd,
-    tgt.public_issuer_bus_ent_short_desc  AS old_pub_bus_ent_short_desc,
-    src.public_issuer_bus_ent_short_desc  AS new_pub_bus_ent_short_desc,
-    tgt.public_issuer_bus_ent_long_desc   AS old_pub_bus_ent_long_desc,
-    src.public_issuer_bus_ent_long_desc   AS new_pub_bus_ent_long_desc,
-    tgt.public_issuer_bus_ent_fmr_id      AS old_pub_bus_ent_fmr_id,
-    src.public_issuer_bus_ent_fmr_id      AS new_pub_bus_ent_fmr_id,
-    tgt.public_issuer_cusip               AS old_pub_issuer_cusip,
-    src.public_issuer_cusip               AS new_pub_issuer_cusip,
-    tgt.public_equity_cusip               AS old_pub_equity_cusip,
-    src.public_equity_cusip               AS new_pub_equity_cusip,
-    tgt.public_equity_isin                AS old_pub_equity_isin,
-    src.public_equity_isin                AS new_pub_equity_isin,
+    ----------------------------------------------------------------
+    -- 1) old vs. new values, null‐defaulted for display:
+    ----------------------------------------------------------------
+    NVL(TO_VARCHAR(tgt.public_registered_entity_id), 'NA')       AS old_pub_reg_ent_id,
+    NVL(TO_VARCHAR(src.public_registered_entity_id), 'NA')       AS new_pub_reg_ent_id,
 
-    -- vendor flags (pre-computed on src)
+    NVL(tgt.public_issuer_bus_ent_id, -1)                         AS old_pub_bus_ent_id,
+    NVL(src.public_issuer_bus_ent_id, -1)                         AS new_pub_bus_ent_id,
+
+    NVL(tgt.public_issuer_bus_ent_type_cd, 'NA')                 AS old_pub_bus_ent_type_cd,
+    NVL(src.public_issuer_bus_ent_type_cd, 'NA')                 AS new_pub_bus_ent_type_cd,
+
+    NVL(tgt.public_issuer_bus_ent_short_desc, 'NA')              AS old_pub_bus_ent_short_desc,
+    NVL(src.public_issuer_bus_ent_short_desc, 'NA')              AS new_pub_bus_ent_short_desc,
+
+    NVL(tgt.public_issuer_bus_ent_long_desc, 'NA')               AS old_pub_bus_ent_long_desc,
+    NVL(src.public_issuer_bus_ent_long_desc, 'NA')               AS new_pub_bus_ent_long_desc,
+
+    NVL(tgt.public_issuer_bus_ent_fmr_id, -1)                     AS old_pub_bus_ent_fmr_id,
+    NVL(src.public_issuer_bus_ent_fmr_id, -1)                     AS new_pub_bus_ent_fmr_id,
+
+    NVL(tgt.public_issuer_cusip, 'NA')                            AS old_pub_issuer_cusip,
+    NVL(src.public_issuer_cusip, 'NA')                            AS new_pub_issuer_cusip,
+
+    NVL(tgt.public_equity_cusip, 'NA')                            AS old_pub_equity_cusip,
+    NVL(src.public_equity_cusip, 'NA')                            AS new_pub_equity_cusip,
+
+    NVL(tgt.public_equity_isin, 'NA')                             AS old_pub_equity_isin,
+    NVL(src.public_equity_isin, 'NA')                             AS new_pub_equity_isin,
+
+    ----------------------------------------------------------------
+    -- 2) vendor flags (unchanged)
+    ----------------------------------------------------------------
     src.is_kmk,
     src.is_sdl,
     src.is_isin,
     src.is_cusip,
 
-    -- pick a single category
+    ----------------------------------------------------------------
+    -- 3) single category pick (unchanged)
+    ----------------------------------------------------------------
     CASE
       WHEN src.is_kmk   THEN 'KMK'
       WHEN src.is_sdl   THEN 'SDL'
@@ -57,26 +74,55 @@ WITH updates AS (
       ELSE               'UNKNOWN'
     END AS category_used,
 
-    -- build a pipe-delimited list of exactly which columns changed, null-safe
+    ----------------------------------------------------------------
+    -- 4) which columns changed?  null‐safe, pipe‐delimited
+    ----------------------------------------------------------------
     CONCAT_WS('|',
-      CASE WHEN NVL(src.public_registered_entity_id, 'NA')    <> NVL(tgt.public_registered_entity_id, 'NA')
-           THEN 'PUBLIC_REGISTERED_ENTITY_ID'                END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_id, -1)         <> NVL(tgt.public_issuer_bus_ent_id, -1)
-           THEN 'PUBLIC_ISSUER_BUS_ENT_ID'                   END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_type_cd, 'NA')  <> NVL(tgt.public_issuer_bus_ent_type_cd, 'NA')
-           THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD'              END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_short_desc, 'NA') <> NVL(tgt.public_issuer_bus_ent_short_desc, 'NA')
-           THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC'           END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_long_desc, 'NA')  <> NVL(tgt.public_issuer_bus_ent_long_desc, 'NA')
-           THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC'            END,
-      CASE WHEN NVL(src.public_issuer_bus_ent_fmr_id, -1)       <> NVL(tgt.public_issuer_bus_ent_fmr_id, -1)
-           THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID'               END,
-      CASE WHEN NVL(src.public_issuer_cusip, 'NA')              <> NVL(tgt.public_issuer_cusip, 'NA')
-           THEN 'PUBLIC_ISSUER_CUSIP'                        END,
-      CASE WHEN NVL(src.public_equity_cusip, 'NA')              <> NVL(tgt.public_equity_cusip, 'NA')
-           THEN 'PUBLIC_EQUITY_CUSIP'                        END,
-      CASE WHEN NVL(src.public_equity_isin, 'NA')               <> NVL(tgt.public_equity_isin, 'NA')
-           THEN 'PUBLIC_EQUITY_ISIN'                         END
+      CASE
+        WHEN NVL(src.public_registered_entity_id,   'NA')
+           <> NVL(tgt.public_registered_entity_id,   'NA')
+        THEN 'PUBLIC_REGISTERED_ENTITY_ID'
+      END,
+      CASE
+        WHEN NVL(src.public_issuer_bus_ent_id,       -1)
+           <> NVL(tgt.public_issuer_bus_ent_id,       -1)
+        THEN 'PUBLIC_ISSUER_BUS_ENT_ID'
+      END,
+      CASE
+        WHEN NVL(src.public_issuer_bus_ent_type_cd,  'NA')
+           <> NVL(tgt.public_issuer_bus_ent_type_cd,  'NA')
+        THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD'
+      END,
+      CASE
+        WHEN NVL(src.public_issuer_bus_ent_short_desc, 'NA')
+           <> NVL(tgt.public_issuer_bus_ent_short_desc, 'NA')
+        THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC'
+      END,
+      CASE
+        WHEN NVL(src.public_issuer_bus_ent_long_desc,  'NA')
+           <> NVL(tgt.public_issuer_bus_ent_long_desc,  'NA')
+        THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC'
+      END,
+      CASE
+        WHEN NVL(src.public_issuer_bus_ent_fmr_id,     -1)
+           <> NVL(tgt.public_issuer_bus_ent_fmr_id,     -1)
+        THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID'
+      END,
+      CASE
+        WHEN NVL(src.public_issuer_cusip,             'NA')
+           <> NVL(tgt.public_issuer_cusip,             'NA')
+        THEN 'PUBLIC_ISSUER_CUSIP'
+      END,
+      CASE
+        WHEN NVL(src.public_equity_cusip,             'NA')
+           <> NVL(tgt.public_equity_cusip,             'NA')
+        THEN 'PUBLIC_EQUITY_CUSIP'
+      END,
+      CASE
+        WHEN NVL(src.public_equity_isin,              'NA')
+           <> NVL(tgt.public_equity_isin,              'NA')
+        THEN 'PUBLIC_EQUITY_ISIN'
+      END
     ) AS fields_changed
 
   FROM SECURITY_REFERENCE_HISTORY_BASE AS tgt
@@ -84,7 +130,7 @@ WITH updates AS (
     ON tgt.registered_entity_id = src.registered_entity_id
    AND tgt.effective_dt         = src.effective_dt
 
-  -- compare two MD5 hashes stored in the src table
+  -- still only rows where the two MD5 hashes differ
   WHERE src.md5_src <> src.md5_tgt
 )
 
@@ -105,8 +151,10 @@ SELECT
   old_pub_equity_isin,        new_pub_equity_isin
 
 FROM updates
+-- only keep rows where at least one field actually changed
 WHERE fields_changed IS NOT NULL
   AND fields_changed <> ''
 ORDER BY registered_entity_id, effective_dt;
+
 
 
