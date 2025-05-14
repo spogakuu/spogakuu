@@ -1,92 +1,95 @@
+WITH audit AS (
+  SELECT
+    -- Key columns
+    srh.registered_entity_id,
+    srh.effective_dt,
+
+    -- Build the pipe-delimited list of changed fields null-safely
+    CONCAT_WS('|',
+      CASE WHEN NVL(srh.public_registered_entity_id, -1)
+             <> NVL(hist.public_registered_entity_id,   -1)
+           THEN 'PUBLIC_REGISTERED_ENTITY_ID' END,
+      CASE WHEN NVL(srh.public_issuer_bus_ent_id, -1)
+             <> NVL(hist.public_issuer_bus_ent_id,     -1)
+           THEN 'PUBLIC_ISSUER_BUS_ENT_ID' END,
+      CASE WHEN NVL(srh.public_issuer_bus_ent_type_cd, 'NA')
+             <> NVL(hist.public_issuer_bus_ent_type_cd, 'NA')
+           THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD' END,
+      CASE WHEN NVL(srh.public_issuer_bus_ent_short_desc, 'NA')
+             <> NVL(hist.public_issuer_bus_ent_short_desc, 'NA')
+           THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC' END,
+      CASE WHEN NVL(srh.public_issuer_bus_ent_long_desc, 'NA')
+             <> NVL(hist.public_issuer_bus_ent_long_desc, 'NA')
+           THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC' END,
+      CASE WHEN NVL(srh.public_issuer_bus_ent_fmr_id, 'NA')
+             <> NVL(hist.public_issuer_bus_ent_fmr_id, 'NA')
+           THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID' END,
+      CASE WHEN NVL(srh.public_issuer_cusip, 'NA')
+             <> NVL(hist.public_issuer_cusip, 'NA')
+           THEN 'PUBLIC_ISSUER_CUSIP' END,
+      CASE WHEN NVL(srh.public_equity_cusip, 'NA')
+             <> NVL(hist.public_equity_cusip, 'NA')
+           THEN 'PUBLIC_EQUITY_CUSIP' END,
+      CASE WHEN NVL(srh.public_equity_isin, 'NA')
+             <> NVL(hist.public_equity_isin, 'NA')
+           THEN 'PUBLIC_EQUITY_ISIN' END
+    ) AS fields_changed,
+
+    -- Old (history) vs. new (incoming) values
+    hist.public_registered_entity_id   AS old_pub_reg_ent_id,
+    srh.public_registered_entity_id    AS new_pub_reg_ent_id,
+    hist.public_issuer_bus_ent_id      AS old_pub_bus_ent_id,
+    srh.public_issuer_bus_ent_id       AS new_pub_bus_ent_id,
+    hist.public_issuer_bus_ent_type_cd AS old_pub_bus_ent_type_cd,
+    srh.public_issuer_bus_ent_type_cd  AS new_pub_bus_ent_type_cd,
+    hist.public_issuer_bus_ent_short_desc AS old_pub_bus_ent_short_desc,
+    srh.public_issuer_bus_ent_short_desc  AS new_pub_bus_ent_short_desc,
+    hist.public_issuer_bus_ent_long_desc  AS old_pub_bus_ent_long_desc,
+    srh.public_issuer_bus_ent_long_desc   AS new_pub_bus_ent_long_desc,
+    hist.public_issuer_bus_ent_fmr_id     AS old_pub_bus_ent_fmr_id,
+    srh.public_issuer_bus_ent_fmr_id      AS new_pub_bus_ent_fmr_id,
+    hist.public_issuer_cusip              AS old_pub_issuer_cusip,
+    srh.public_issuer_cusip               AS new_pub_issuer_cusip,
+    hist.public_equity_cusip              AS old_pub_equity_cusip,
+    srh.public_equity_cusip               AS new_pub_equity_cusip,
+    hist.public_equity_isin               AS old_pub_equity_isin,
+    srh.public_equity_isin                AS new_pub_equity_isin
+
+  FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT AS srh
+  JOIN SECURITY_REFERENCE_HISTORY_BASE    AS hist
+    ON srh.registered_entity_id = hist.registered_entity_id
+   AND srh.effective_dt         = hist.effective_dt
+
+  -- Only rows where the MD5 hashes differ
+  WHERE srh.md5_src <> srh.md5_tgt
+)
+
 SELECT
-  srh.registered_entity_id,
-  srh.effective_dt,
-  srh.md5_src,
-  srh.md5_tgt,
+  registered_entity_id,
+  effective_dt,
+  fields_changed,
 
-  -- old (prod) vs. new (incoming) columns
-  hist.public_registered_entity_id   AS old_pub_reg_ent_id,
-  srh.public_registered_entity_id    AS new_pub_reg_ent_id,
-  hist.public_issuer_bus_ent_id      AS old_pub_bus_ent_id,
-  srh.public_issuer_bus_ent_id       AS new_pub_bus_ent_id,
-  hist.public_issuer_bus_ent_type_cd AS old_pub_bus_ent_type_cd,
-  srh.public_issuer_bus_ent_type_cd  AS new_pub_bus_ent_type_cd,
-  hist.public_issuer_bus_ent_short_desc AS old_pub_bus_ent_short_desc,
-  srh.public_issuer_bus_ent_short_desc  AS new_pub_bus_ent_short_desc,
-  hist.public_issuer_bus_ent_long_desc  AS old_pub_bus_ent_long_desc,
-  srh.public_issuer_bus_ent_long_desc   AS new_pub_bus_ent_long_desc,
-  hist.public_issuer_bus_ent_fmr_id     AS old_pub_bus_ent_fmr_id,
-  srh.public_issuer_bus_ent_fmr_id      AS new_pub_bus_ent_fmr_id,
-  hist.public_issuer_cusip              AS old_pub_issuer_cusip,
-  srh.public_issuer_cusip               AS new_pub_issuer_cusip,
-  hist.public_equity_cusip              AS old_pub_equity_cusip,
-  srh.public_equity_cusip               AS new_pub_equity_cusip,
-  hist.public_equity_isin               AS old_pub_equity_isin,
-  srh.public_equity_isin                AS new_pub_equity_isin,
+  old_pub_reg_ent_id,
+  new_pub_reg_ent_id,
+  old_pub_bus_ent_id,
+  new_pub_bus_ent_id,
+  old_pub_bus_ent_type_cd,
+  new_pub_bus_ent_type_cd,
+  old_pub_bus_ent_short_desc,
+  new_pub_bus_ent_short_desc,
+  old_pub_bus_ent_long_desc,
+  new_pub_bus_ent_long_desc,
+  old_pub_bus_ent_fmr_id,
+  new_pub_bus_ent_fmr_id,
+  old_pub_issuer_cusip,
+  new_pub_issuer_cusip,
+  old_pub_equity_cusip,
+  new_pub_equity_cusip,
+  old_pub_equity_isin,
+  new_pub_equity_isin
 
-  -- build a pipe-separated list of changed fields
-  CONCAT_WS('|',
-    CASE WHEN NVL(srh.public_registered_entity_id, -1)
-           <> NVL(hist.public_registered_entity_id, -1)
-         THEN 'PUBLIC_REGISTERED_ENTITY_ID' END,
-    CASE WHEN NVL(srh.public_issuer_bus_ent_id, -1)
-           <> NVL(hist.public_issuer_bus_ent_id, -1)
-         THEN 'PUBLIC_ISSUER_BUS_ENT_ID' END,
-    CASE WHEN NVL(srh.public_issuer_bus_ent_type_cd, 'NA')
-           <> NVL(hist.public_issuer_bus_ent_type_cd, 'NA')
-         THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD' END,
-    CASE WHEN NVL(srh.public_issuer_bus_ent_short_desc, 'NA')
-           <> NVL(hist.public_issuer_bus_ent_short_desc, 'NA')
-         THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC' END,
-    CASE WHEN NVL(srh.public_issuer_bus_ent_long_desc, 'NA')
-           <> NVL(hist.public_issuer_bus_ent_long_desc, 'NA')
-         THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC' END,
-    CASE WHEN NVL(srh.public_issuer_bus_ent_fmr_id, 'NA')
-           <> NVL(hist.public_issuer_bus_ent_fmr_id, 'NA')
-         THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID' END,
-    CASE WHEN NVL(srh.public_issuer_cusip, 'NA')
-           <> NVL(hist.public_issuer_cusip, 'NA')
-         THEN 'PUBLIC_ISSUER_CUSIP' END,
-    CASE WHEN NVL(srh.public_equity_cusip, 'NA')
-           <> NVL(hist.public_equity_cusip, 'NA')
-         THEN 'PUBLIC_EQUITY_CUSIP' END,
-    CASE WHEN NVL(srh.public_equity_isin, 'NA')
-           <> NVL(hist.public_equity_isin, 'NA')
-         THEN 'PUBLIC_EQUITY_ISIN' END
-  ) AS fields_changed
-
-FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT AS srh
-JOIN SECURITY_REFERENCE_HISTORY_BASE    AS hist
-  ON srh.registered_entity_id = hist.registered_entity_id
- AND srh.effective_dt         = hist.effective_dt
-WHERE srh.md5_src <> srh.md5_tgt
-  AND CONCAT_WS('|',
-        CASE WHEN NVL(srh.public_registered_entity_id, -1)
-               <> NVL(hist.public_registered_entity_id, -1)
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_issuer_bus_ent_id, -1)
-               <> NVL(hist.public_issuer_bus_ent_id, -1)
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_issuer_bus_ent_type_cd, 'NA')
-               <> NVL(hist.public_issuer_bus_ent_type_cd, 'NA')
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_issuer_bus_ent_short_desc, 'NA')
-               <> NVL(hist.public_issuer_bus_ent_short_desc, 'NA')
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_issuer_bus_ent_long_desc, 'NA')
-               <> NVL(hist.public_issuer_bus_ent_long_desc, 'NA')
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_issuer_bus_ent_fmr_id, 'NA')
-               <> NVL(hist.public_issuer_bus_ent_fmr_id, 'NA')
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_issuer_cusip, 'NA')
-               <> NVL(hist.public_issuer_cusip, 'NA')
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_equity_cusip, 'NA')
-               <> NVL(hist.public_equity_cusip, 'NA')
-             THEN 'A' END,
-        CASE WHEN NVL(srh.public_equity_isin, 'NA')
-               <> NVL(hist.public_equity_isin, 'NA')
-             THEN 'A' END
-      ) <> ''  -- ensure at least one field differs
-ORDER BY srh.registered_entity_id, srh.effective_dt;
+FROM audit
+-- Ensure at least one field was flagged
+WHERE fields_changed IS NOT NULL
+  AND fields_changed <> ''
+ORDER BY registered_entity_id, effective_dt;
