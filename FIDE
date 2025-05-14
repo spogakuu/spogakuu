@@ -14,6 +14,9 @@ SET
 CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
 CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
 
+
+CREATE OR REPLACE TABLE SECURITY_REFERENCE_UPDATES AS
+
 WITH updates AS (
   SELECT
     tgt.registered_entity_id,
@@ -54,23 +57,26 @@ WITH updates AS (
       ELSE               'UNKNOWN'
     END AS category_used,
 
-    -- build a pipe-delimited list of exactly which columns changed
+    -- build a pipe-delimited list of exactly which columns changed, null-safe
     CONCAT_WS('|',
-      CASE WHEN src.public_registered_entity_id    <> tgt.public_registered_entity_id    THEN 'PUBLIC_REGISTERED_ENTITY_ID'    END,
-      CASE WHEN src.public_issuer_bus_ent_id       <> tgt.public_issuer_bus_ent_id       THEN 'PUBLIC_ISSUER_BUS_ENT_ID'       END,
-      CASE WHEN src.public_issuer_bus_ent_type_cd  <> tgt.public_issuer_bus_ent_type_cd  THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD'  END,
-      CASE WHEN src.public_issuer_bus_ent_short_desc <> tgt.public_issuer_bus_ent_short_desc 
-           THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC' END,
-      CASE WHEN src.public_issuer_bus_ent_long_desc  <> tgt.public_issuer_bus_ent_long_desc  
-           THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC'  END,
-      CASE WHEN src.public_issuer_bus_ent_fmr_id     <> tgt.public_issuer_bus_ent_fmr_id     
-           THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID'     END,
-      CASE WHEN src.public_issuer_cusip              <> tgt.public_issuer_cusip              
-           THEN 'PUBLIC_ISSUER_CUSIP'             END,
-      CASE WHEN src.public_equity_cusip              <> tgt.public_equity_cusip              
-           THEN 'PUBLIC_EQUITY_CUSIP'             END,
-      CASE WHEN src.public_equity_isin               <> tgt.public_equity_isin               
-           THEN 'PUBLIC_EQUITY_ISIN'              END
+      CASE WHEN NVL(src.public_registered_entity_id, 'NA')    <> NVL(tgt.public_registered_entity_id, 'NA')
+           THEN 'PUBLIC_REGISTERED_ENTITY_ID'                END,
+      CASE WHEN NVL(src.public_issuer_bus_ent_id, -1)         <> NVL(tgt.public_issuer_bus_ent_id, -1)
+           THEN 'PUBLIC_ISSUER_BUS_ENT_ID'                   END,
+      CASE WHEN NVL(src.public_issuer_bus_ent_type_cd, 'NA')  <> NVL(tgt.public_issuer_bus_ent_type_cd, 'NA')
+           THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD'              END,
+      CASE WHEN NVL(src.public_issuer_bus_ent_short_desc, 'NA') <> NVL(tgt.public_issuer_bus_ent_short_desc, 'NA')
+           THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC'           END,
+      CASE WHEN NVL(src.public_issuer_bus_ent_long_desc, 'NA')  <> NVL(tgt.public_issuer_bus_ent_long_desc, 'NA')
+           THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC'            END,
+      CASE WHEN NVL(src.public_issuer_bus_ent_fmr_id, -1)       <> NVL(tgt.public_issuer_bus_ent_fmr_id, -1)
+           THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID'               END,
+      CASE WHEN NVL(src.public_issuer_cusip, 'NA')              <> NVL(tgt.public_issuer_cusip, 'NA')
+           THEN 'PUBLIC_ISSUER_CUSIP'                        END,
+      CASE WHEN NVL(src.public_equity_cusip, 'NA')              <> NVL(tgt.public_equity_cusip, 'NA')
+           THEN 'PUBLIC_EQUITY_CUSIP'                        END,
+      CASE WHEN NVL(src.public_equity_isin, 'NA')               <> NVL(tgt.public_equity_isin, 'NA')
+           THEN 'PUBLIC_EQUITY_ISIN'                         END
     ) AS fields_changed
 
   FROM SECURITY_REFERENCE_HISTORY_BASE AS tgt
@@ -88,9 +94,9 @@ SELECT
   category_used,
   fields_changed,
 
-  old_pub_reg_ent_id,     new_pub_reg_ent_id,
-  old_pub_bus_ent_id,     new_pub_bus_ent_id,
-  old_pub_bus_ent_type_cd, new_pub_bus_ent_type_cd,
+  old_pub_reg_ent_id,        new_pub_reg_ent_id,
+  old_pub_bus_ent_id,        new_pub_bus_ent_id,
+  old_pub_bus_ent_type_cd,   new_pub_bus_ent_type_cd,
   old_pub_bus_ent_short_desc, new_pub_bus_ent_short_desc,
   old_pub_bus_ent_long_desc,  new_pub_bus_ent_long_desc,
   old_pub_bus_ent_fmr_id,     new_pub_bus_ent_fmr_id,
@@ -99,5 +105,8 @@ SELECT
   old_pub_equity_isin,        new_pub_equity_isin
 
 FROM updates
+WHERE fields_changed IS NOT NULL
+  AND fields_changed <> ''
 ORDER BY registered_entity_id, effective_dt;
+
 
