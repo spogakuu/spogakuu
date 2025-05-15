@@ -1,64 +1,70 @@
+CREATE OR REPLACE TABLE PUBLIC_ATTR_SRH_AUDIT AS
+
 SELECT
+  -- keys + hashes
   alt.registered_entity_id,
   alt.effective_dt,
-  alt.md5_src       AS incoming_md5,
-  prod.md5_tgt      AS prod_md5,
+  alt.md5_src         AS incoming_md5,
+  prod.md5_tgt        AS prod_md5,
 
-  -- build a pipe-delimited list of exactly which audited columns differ
+  -- old vs. new values
+  prod.public_registered_entity_id    AS old_pub_reg_ent_id,
+  alt.public_registered_entity_id     AS new_pub_reg_ent_id,
+  prod.public_issuer_bus_ent_id       AS old_pub_bus_ent_id,
+  alt.public_issuer_bus_ent_id        AS new_pub_bus_ent_id,
+  prod.public_issuer_bus_ent_type_cd  AS old_pub_bus_ent_type_cd,
+  alt.public_issuer_bus_ent_type_cd   AS new_pub_bus_ent_type_cd,
+  prod.public_issuer_bus_ent_short_desc AS old_pub_bus_ent_short_desc,
+  alt.public_issuer_bus_ent_short_desc  AS new_pub_bus_ent_short_desc,
+  prod.public_issuer_bus_ent_long_desc  AS old_pub_bus_ent_long_desc,
+  alt.public_issuer_bus_ent_long_desc   AS new_pub_bus_ent_long_desc,
+  prod.public_issuer_bus_ent_fmr_id     AS old_pub_bus_ent_fmr_id,
+  alt.public_issuer_bus_ent_fmr_id      AS new_pub_bus_ent_fmr_id,
+  prod.public_issuer_cusip              AS old_pub_issuer_cusip,
+  alt.public_issuer_cusip               AS new_pub_issuer_cusip,
+  prod.public_equity_cusip              AS old_pub_equity_cusip,
+  alt.public_equity_cusip               AS new_pub_equity_cusip,
+  prod.public_equity_isin               AS old_pub_equity_isin,
+  alt.public_equity_isin                AS new_pub_equity_isin,
+
+  -- which fields actually changed?
   CONCAT_WS('|',
-    CASE WHEN NVL(alt.public_registered_entity_id, -1)
-           <> NVL(prod.public_registered_entity_id, -1)
+    CASE WHEN NVL(alt.public_registered_entity_id,   -1) <> NVL(prod.public_registered_entity_id,   -1)
          THEN 'PUBLIC_REGISTERED_ENTITY_ID' END,
-    CASE WHEN NVL(alt.public_issuer_bus_ent_id, -1)
-           <> NVL(prod.public_issuer_bus_ent_id, -1)
+    CASE WHEN NVL(alt.public_issuer_bus_ent_id,      -1) <> NVL(prod.public_issuer_bus_ent_id,      -1)
          THEN 'PUBLIC_ISSUER_BUS_ENT_ID' END,
-    CASE WHEN NVL(alt.public_issuer_bus_ent_type_cd, 'NA')
-           <> NVL(prod.public_issuer_bus_ent_type_cd, 'NA')
+    CASE WHEN NVL(alt.public_issuer_bus_ent_type_cd, 'NA') <> NVL(prod.public_issuer_bus_ent_type_cd, 'NA')
          THEN 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD' END,
-    CASE WHEN NVL(alt.public_issuer_bus_ent_short_desc, 'NA')
-           <> NVL(prod.public_issuer_bus_ent_short_desc, 'NA')
+    CASE WHEN NVL(alt.public_issuer_bus_ent_short_desc,'NA') <> NVL(prod.public_issuer_bus_ent_short_desc,'NA')
          THEN 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC' END,
-    CASE WHEN NVL(alt.public_issuer_bus_ent_long_desc, 'NA')
-           <> NVL(prod.public_issuer_bus_ent_long_desc, 'NA')
+    CASE WHEN NVL(alt.public_issuer_bus_ent_long_desc, 'NA') <> NVL(prod.public_issuer_bus_ent_long_desc, 'NA')
          THEN 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC' END,
-    CASE WHEN NVL(alt.public_issuer_bus_ent_fmr_id, 'NA')
-           <> NVL(prod.public_issuer_bus_ent_fmr_id, 'NA')
+    CASE WHEN NVL(alt.public_issuer_bus_ent_fmr_id,   'NA') <> NVL(prod.public_issuer_bus_ent_fmr_id,   'NA')
          THEN 'PUBLIC_ISSUER_BUS_ENT_FMR_ID' END,
-    CASE WHEN NVL(alt.public_issuer_cusip, 'NA')
-           <> NVL(prod.public_issuer_cusip, 'NA')
+    CASE WHEN NVL(alt.public_issuer_cusip,            'NA') <> NVL(prod.public_issuer_cusip,            'NA')
          THEN 'PUBLIC_ISSUER_CUSIP' END,
-    CASE WHEN NVL(alt.public_equity_cusip, 'NA')
-           <> NVL(prod.public_equity_cusip, 'NA')
+    CASE WHEN NVL(alt.public_equity_cusip,            'NA') <> NVL(prod.public_equity_cusip,            'NA')
          THEN 'PUBLIC_EQUITY_CUSIP' END,
-    CASE WHEN NVL(alt.public_equity_isin, 'NA')
-           <> NVL(prod.public_equity_isin, 'NA')
+    CASE WHEN NVL(alt.public_equity_isin,             'NA') <> NVL(prod.public_equity_isin,             'NA')
          THEN 'PUBLIC_EQUITY_ISIN' END
   ) AS fields_changed
 
-FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT alt
-JOIN PRODUCTION.SECURITY_REFERENCE_HISTORY_BASE prod
+FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT AS alt
+JOIN SECURITY_REFERENCE_HISTORY_BASE     AS prod
   ON alt.registered_entity_id = prod.registered_entity_id
  AND alt.effective_dt         = prod.effective_dt
+
+-- only keep true MD5 mismatches with at least one field diff
 WHERE alt.md5_src <> prod.md5_tgt
   AND CONCAT_WS('|',
-      CASE WHEN NVL(alt.public_registered_entity_id, -1)
-             <> NVL(prod.public_registered_entity_id, -1) THEN 'X' END,
-      CASE WHEN NVL(alt.public_issuer_bus_ent_id, -1)
-             <> NVL(prod.public_issuer_bus_ent_id, -1) THEN 'X' END,
-      CASE WHEN NVL(alt.public_issuer_bus_ent_type_cd, 'NA')
-             <> NVL(prod.public_issuer_bus_ent_type_cd, 'NA') THEN 'X' END,
-      CASE WHEN NVL(alt.public_issuer_bus_ent_short_desc, 'NA')
-             <> NVL(prod.public_issuer_bus_ent_short_desc, 'NA') THEN 'X' END,
-      CASE WHEN NVL(alt.public_issuer_bus_ent_long_desc, 'NA')
-             <> NVL(prod.public_issuer_bus_ent_long_desc, 'NA') THEN 'X' END,
-      CASE WHEN NVL(alt.public_issuer_bus_ent_fmr_id, 'NA')
-             <> NVL(prod.public_issuer_bus_ent_fmr_id, 'NA') THEN 'X' END,
-      CASE WHEN NVL(alt.public_issuer_cusip, 'NA')
-             <> NVL(prod.public_issuer_cusip, 'NA') THEN 'X' END,
-      CASE WHEN NVL(alt.public_equity_cusip, 'NA')
-             <> NVL(prod.public_equity_cusip, 'NA') THEN 'X' END,
-      CASE WHEN NVL(alt.public_equity_isin, 'NA')
-             <> NVL(prod.public_equity_isin, 'NA') THEN 'X' END
-    ) <> ''
-ORDER BY alt.registered_entity_id, alt.effective_dt
-LIMIT 20;
+        CASE WHEN NVL(alt.public_registered_entity_id,   -1) <> NVL(prod.public_registered_entity_id,   -1) THEN 'X' END,
+        CASE WHEN NVL(alt.public_issuer_bus_ent_id,      -1) <> NVL(prod.public_issuer_bus_ent_id,      -1) THEN 'X' END,
+        CASE WHEN NVL(alt.public_issuer_bus_ent_type_cd, 'NA') <> NVL(prod.public_issuer_bus_ent_type_cd, 'NA') THEN 'X' END,
+        CASE WHEN NVL(alt.public_issuer_bus_ent_short_desc,'NA') <> NVL(prod.public_issuer_bus_ent_short_desc,'NA') THEN 'X' END,
+        CASE WHEN NVL(alt.public_issuer_bus_ent_long_desc, 'NA') <> NVL(prod.public_issuer_bus_ent_long_desc, 'NA') THEN 'X' END,
+        CASE WHEN NVL(alt.public_issuer_bus_ent_fmr_id,   'NA') <> NVL(prod.public_issuer_bus_ent_fmr_id,   'NA') THEN 'X' END,
+        CASE WHEN NVL(alt.public_issuer_cusip,            'NA') <> NVL(prod.public_issuer_cusip,            'NA') THEN 'X' END,
+        CASE WHEN NVL(alt.public_equity_cusip,            'NA') <> NVL(prod.public_equity_cusip,            'NA') THEN 'X' END,
+        CASE WHEN NVL(alt.public_equity_isin,             'NA') <> NVL(prod.public_equity_isin,             'NA') THEN 'X' END
+      ) <> ''
+;
