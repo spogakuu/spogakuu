@@ -1,46 +1,14 @@
-SELECT
-  alt.registered_entity_id,
-  alt.effective_dt,
-
-  -- build fields_changed via inline VALUES + LISTAGG
-  (
-    SELECT LISTAGG(label, '|') WITHIN GROUP (ORDER BY ord)
-    FROM (
-      VALUES
-        (1, 'PUBLIC_REGISTERED_ENTITY_ID',   
-              NVL(alt.public_registered_entity_id,   -1)
-           <> NVL(prod.public_registered_entity_id,   -1)),
-        (2, 'PUBLIC_ISSUER_BUS_ENT_ID',
-              NVL(alt.public_issuer_bus_ent_id,      -1)
-           <> NVL(prod.public_issuer_bus_ent_id,      -1)),
-        (3, 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD',
-              NVL(alt.public_issuer_bus_ent_type_cd, 'NA')
-           <> NVL(prod.public_issuer_bus_ent_type_cd, 'NA')),
-        (4, 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC',
-              NVL(alt.public_issuer_bus_ent_short_desc,'NA')
-           <> NVL(prod.public_issuer_bus_ent_short_desc,'NA')),
-        (5, 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC',
-              NVL(alt.public_issuer_bus_ent_long_desc, 'NA')
-           <> NVL(prod.public_issuer_bus_ent_long_desc, 'NA')),
-        (6, 'PUBLIC_ISSUER_BUS_ENT_FMR_ID',
-              NVL(alt.public_issuer_bus_ent_fmr_id,   'NA')
-           <> NVL(prod.public_issuer_bus_ent_fmr_id,   'NA')),
-        (7, 'PUBLIC_ISSUER_CUSIP',
-              NVL(alt.public_issuer_cusip,            'NA')
-           <> NVL(prod.public_issuer_cusip,            'NA')),
-        (8, 'PUBLIC_EQUITY_CUSIP',
-              NVL(alt.public_equity_cusip,            'NA')
-           <> NVL(prod.public_equity_cusip,            'NA')),
-        (9, 'PUBLIC_EQUITY_ISIN',
-              NVL(alt.public_equity_isin,             'NA')
-           <> NVL(prod.public_equity_isin,             'NA'))
-    ) AS t(ord, label, changed)
-    WHERE changed
-  ) AS fields_changed
-
-FROM PUBLIC_ATTR_TRNS_SRH_ALTID_QDATA_ALT AS alt
-JOIN SECURITY_REFERENCE_HISTORY_BASE    AS prod
-  ON alt.registered_entity_id = prod.registered_entity_id
- AND alt.effective_dt         = prod.effective_dt
-WHERE alt.md5_src <> prod.md5_tgt
-;
+ARRAY_TO_STRING(
+    ARRAY_CONSTRUCT_COMPACT(
+      IFF(NVL(alt.public_registered_entity_id, -1) <> NVL(prod.public_registered_entity_id, -1), 'PUBLIC_REGISTERED_ENTITY_ID', NULL),
+      IFF(NVL(alt.public_issuer_bus_ent_id, -1) <> NVL(prod.public_issuer_bus_ent_id, -1), 'PUBLIC_ISSUER_BUS_ENT_ID', NULL),
+      IFF(NVL(alt.public_issuer_bus_ent_type_cd, 'NA') <> NVL(prod.public_issuer_bus_ent_type_cd, 'NA'), 'PUBLIC_ISSUER_BUS_ENT_TYPE_CD', NULL),
+      IFF(NVL(alt.public_issuer_bus_ent_short_desc, 'NA') <> NVL(prod.public_issuer_bus_ent_short_desc, 'NA'), 'PUBLIC_ISSUER_BUS_ENT_SHORT_DESC', NULL),
+      IFF(NVL(alt.public_issuer_bus_ent_long_desc, 'NA') <> NVL(prod.public_issuer_bus_ent_long_desc, 'NA'), 'PUBLIC_ISSUER_BUS_ENT_LONG_DESC', NULL),
+      IFF(NVL(alt.public_issuer_bus_ent_fmr_id, 'NA') <> NVL(prod.public_issuer_bus_ent_fmr_id, 'NA'), 'PUBLIC_ISSUER_BUS_ENT_FMR_ID', NULL),
+      IFF(NVL(alt.public_issuer_cusip, 'NA') <> NVL(prod.public_issuer_cusip, 'NA'), 'PUBLIC_ISSUER_CUSIP', NULL),
+      IFF(NVL(alt.public_equity_cusip, 'NA') <> NVL(prod.public_equity_cusip, 'NA'), 'PUBLIC_EQUITY_CUSIP', NULL),
+      IFF(NVL(alt.public_equity_isin, 'NA') <> NVL(prod.public_equity_isin, 'NA'), 'PUBLIC_EQUITY_ISIN', NULL)
+    ),
+    '|'
+  ) AS fields_changed,
