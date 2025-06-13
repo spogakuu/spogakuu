@@ -1,7 +1,5 @@
-# SNAPSHOT_LOGIC with Lock Handling: threadpool + re-run + hash_value + file lock
-
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, to_date, sha2, concat_ws, when, lit, date_format
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit, date_format
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pytz
@@ -12,6 +10,7 @@ import os
 # Initialize Spark
 spark = SparkSession.builder.appName("Process Incremental Tables").getOrCreate()
 spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
 
 # Config Paths
 staging_path = "Files/BRONZE/INCREMENTAL_LOAD"
@@ -19,30 +18,29 @@ copy_path = "Files/BRONZE/SNAPSHOT/INCREMENTAL"
 table_list_path = "Files/TABLES_LIST"
 daily_log_path = "Files/BRONZE/SNAPSHOT/LOGS/Daily_Incremental_Logs"
 main_log_path = "Files/BRONZE/SNAPSHOT/LOGS/Final_Incremental_Logs"
-
-# Lock file path
-lock_file = "/mnt/data/update_log.lock"
+lock_file = "/tmp/update_log.lock"
 
 # Date
 tz = pytz.timezone("US/Central")
 Today_date = datetime.now(tz).strftime("%Y-%m-%d")
 
-# Acquire lock
+# Lock utility
 def acquire_lock():
     if os.path.exists(lock_file):
         return False
     with open(lock_file, 'w') as f:
-        f.write("locked at " + datetime.now().isoformat())
+        f.write("locked")
     return True
 
-# Release lock
 def release_lock():
     if os.path.exists(lock_file):
         os.remove(lock_file)
 
 # Thread-safe log write with lock
-def update_log(table_name, status, start_time, end_time, error_message=""):
-    new_row = [(table_name, status, Today_date, start_time.isoformat(), end_time.isoformat(), error_message)]
+def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0, error_message=""):
+    from datetime import datetime
+    utc_ts_obj = datetime.strptime(utc_timestamp, "%Y-%m-%d")
+    new_row = [(table_name, status, datetime.strptime(Today_date, "%Y-%m-%d").date(), utc_ts_obj, start_time.isoformat(), end_time.isoformat(), count, error_message)]
     try:
         schema = spark.read.parquet(daily_log_path).schema
     except:
@@ -54,13 +52,19 @@ def update_log(table_name, status, start_time, end_time, error_message=""):
             return
     new_df = spark.createDataFrame(new_row, schema)
 
-    if acquire_lock():
+    while not acquire_lock():
+        continue
+
+    try:
         try:
-            new_df.write.mode("append").parquet(daily_log_path)
-        finally:
-            release_lock()
-    else:
-        print(f"[WAIT] Another process is writing logs. Try again later.")
+            existing_df = spark.read.parquet(daily_log_path)
+            filtered_df = existing_df.filter(~((col("table_name") == table_name) & (col("load_date") == Today_date) & (col("UTCTimestamp") == utc_ts_obj)))
+            final_df = filtered_df.unionByName(new_df)
+        except:
+            final_df = new_df
+        final_df.write.mode("overwrite").parquet(daily_log_path)
+    finally:
+        release_lock()
 
 # Add ROW_HASH without modifying original data, null → space
 def add_hash_column(df):
@@ -92,45 +96,46 @@ def load_table(table_name, key_column):
         update_df = spark.read.parquet(update_path)
         delete_df = spark.read.parquet(delete_path)
 
-        if not insert_df.rdd.isEmpty():
-            insert_view = insert_df.filter(date_format(col("INSERT_TIMESTAMP"), "yyyy-MM-dd") == Today_date)
-            copy_table = copy_table.unionByName(insert_view, allowMissingColumns=True)
+        utc_dates = insert_df.select(date_format(col("UTCTimestamp"), "yyyy-MM-dd")).distinct().rdd.flatMap(lambda x: x).collect()
 
-        if not update_df.rdd.isEmpty():
-            update_view = update_df.filter(date_format(col("INSERT_TIMESTAMP"), "yyyy-MM-dd") == Today_date)
-            copy_table = copy_table.unionByName(update_view, allowMissingColumns=True)
+        for utc_day in utc_dates:
+            insert_view = insert_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day)
+            update_view = update_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day)
+            delete_view = delete_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day)
 
-        if not delete_df.rdd.isEmpty():
-            delete_view = delete_df.filter(date_format(col("INSERT_TIMESTAMP"), "yyyy-MM-dd") == Today_date)
-            copy_table = copy_table.join(delete_view, copy_table[key_column] == delete_view[key_column], "left_anti")
+            insert_count = insert_view.count() if not insert_view.rdd.isEmpty() else 0
+            update_count = update_view.count() if not update_view.rdd.isEmpty() else 0
 
-        # Add row hash
-        copy_table = add_hash_column(copy_table)
+            merged_view = insert_view.unionByName(update_view, allowMissingColumns=True)
 
-        # Clean temp path before write
-        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-        temp_path = spark._jvm.org.apache.hadoop.fs.Path(temp_table_path)
-        if fs.exists(temp_path):
-            fs.delete(temp_path, True)
-            print(f"Deleted temp path before write: {temp_table_path}")
+            if not delete_view.rdd.isEmpty():
+                delete_keys = delete_view.select(col("row_number").alias(key_column)).distinct()
+                copy_table = copy_table.join(delete_keys, key_column, "left_anti")
 
-        # Write temp table
-        copy_table.write.mode("overwrite").parquet(temp_table_path)
+            if not merged_view.rdd.isEmpty():
+                copy_table = copy_table.unionByName(merged_view, allowMissingColumns=True)
 
-        # Rename to final table path
-        original_path = spark._jvm.org.apache.hadoop.fs.Path(copy_table_path)
-        if fs.exists(original_path):
-            fs.delete(original_path, True)
-        fs.rename(temp_path, original_path)
-        print(f"{table_name} - Temp moved to: {copy_table_path}")
+            copy_table = add_hash_column(copy_table)
 
-        end_time = datetime.now()
-        update_log(table_name, "SUCCESS", start_time, end_time)
+            fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+            temp_path = spark._jvm.org.apache.hadoop.fs.Path(temp_table_path)
+            if fs.exists(temp_path):
+                fs.delete(temp_path, True)
+            copy_table.write.mode("append").parquet(temp_table_path)
+
+            original_path = spark._jvm.org.apache.hadoop.fs.Path(copy_table_path)
+            if fs.exists(original_path):
+                fs.delete(original_path, True)
+            fs.rename(temp_path, original_path)
+
+            end_time = datetime.now()
+            update_log(table_name, "I", utc_day, start_time, end_time, insert_count)
+            update_log(table_name, "U", utc_day, start_time, end_time, update_count)
 
     except Exception as e:
         end_time = datetime.now()
         print(f"{table_name} - Error: {e}")
-        update_log(table_name, "FAILURE", start_time, end_time, traceback.format_exc())
+        update_log(table_name, "FAILURE", Today_date, start_time, end_time, 0, traceback.format_exc())
 
 # Load table list
 table_list_df = spark.read.parquet(table_list_path)
