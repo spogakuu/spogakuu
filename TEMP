@@ -1,110 +1,66 @@
+from pyspark.sql.functions import col, split, lit
 from datetime import datetime
 import pytz
-import time
-from pyspark.sql.functions import col
-from pyspark.sql import Row
-from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
+import json
+import os
 from notebookutils import mssparkutils
 
-# ==== PARAMETERS ====
-base_table = table_name           # from pipeline
-operation = operation             # from pipeline
-status_val = "Succeeded"
-error_msg = ""
+# === CONFIG ===
+log_path = "Files/BRONZE/STAGING_LOGS"
+table_list_path = "Files/TABLES_LIST"
 
-# ==== TIMEZONE ====
+# === TIMEZONE ===
 tz = pytz.timezone("America/Chicago")
-now = datetime.now(tz)
-run_date = now.date()
+today = datetime.now(tz).date()
 
-# ==== PATHS ====
-log_path = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS"
-temp_path = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS_TEMP"
-lock_file = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS_LOCK"
-input_path = f"Files/BRONZE/INCREMENTAL_LOAD/{base_table}_{operation}"
+# === Get Table and UTC from base parameters ===
+table_name = mssparkutils.env.get("table_name")
+utc_timestamp = mssparkutils.env.get("utc_timestamp")
 
-# ==== LOG SCHEMA ====
-schema = StructType([
-    StructField("run_date", DateType(), True),
-    StructField("table_name", StringType(), True),
-    StructField("operation", StringType(), True),
-    StructField("status", StringType(), True),
-    StructField("error_message", StringType(), True),
-    StructField("UTCTimestamp", DateType(), True)
-])
-
-# ==== Read processed data ====
-try:
-    df = spark.read.parquet(input_path)
-    utc_dates = df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
-    
-    # Fix: Convert string or timestamp to date objects
-    from datetime import date
-    utc_dates = [dt.date() if hasattr(dt, 'date') else datetime.strptime(str(dt), "%Y-%m-%d").date() for dt in utc_dates]
-
-except:
-    utc_dates = []
-
-# ==== If nothing found, exit ====
-if not utc_dates:
-    print(f"[LOG] No data processed for {base_table}_{operation}")
-    mssparkutils.notebook.exit("NO-UTC-FOUND")
-
-# ==== Create log rows ====
-log_rows = [
-    Row(
-        run_date=run_date,
-        table_name=f"{base_table}_{operation}",
-        operation=operation,
-        status=status_val,
-        error_message=error_msg,
-        UTCTimestamp=utc
-    ) for utc in utc_dates
-]
-
-# ==== Acquire lock ====
-fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-lock_path_obj = spark._jvm.org.apache.hadoop.fs.Path(lock_file)
-start_time = time.time()
-timeout = 60
-
-while fs.exists(lock_path_obj):
-    if time.time() - start_time > timeout:
-        raise TimeoutError("[LOCK] Timeout waiting for STAGING_LOGS lock.")
-    time.sleep(5)
-
-fs.create(lock_path_obj)
+# === Load active tables ===
+df_all = spark.read.parquet(table_list_path)
+df_active = df_all.filter((col("STATUS") == "A") & (col("LOAD_TYPE") == "INCREMENTAL"))
 
 try:
-    # Read existing logs
-    try:
-        df_existing = spark.read.schema(schema).parquet(log_path)
-    except:
-        df_existing = spark.createDataFrame([], schema)
+    # === Read staging logs ===
+    df_log = spark.read.parquet(log_path)
 
-    # Remove any duplicates (same table + op + UTC)
-    for utc in utc_dates:
-        df_existing = df_existing.filter(~(
-            (col("table_name") == f"{base_table}_{operation}") &
-            (col("operation") == operation) &
-            (col("UTCTimestamp") == utc)
-        ))
+    # === Filter for today, table, and UTC ===
+    df_filtered = df_log.filter(
+        (col("UTCTimestamp") == utc_timestamp) &
+        (col("table_name").startswith(table_name))  # e.g., patient_data_INSERT
+    )
 
-    # Merge and write
-    df_updated = df_existing.unionByName(spark.createDataFrame(log_rows, schema=schema))
-    df_updated.write.mode("overwrite").parquet(temp_path)
+    if df_filtered.count() == 0:
+        # No entry → return full operations for this table
+        meta = df_active.filter(col("TABLE_NAME") == table_name).collect()[0]
+        result = [
+            {
+                "table_name": meta["TABLE_NAME"],
+                "key_column": meta["KEY_COLUMN"],
+                "status": meta["STATUS"],
+                "database": meta["DATABASE"],
+                "schema": meta["SCHEMA"],
+                "operation": "ALL"
+            }
+        ]
+        mssparkutils.notebook.exit(json.dumps(result))
 
-    # Atomic move
-    fs_temp = spark._jvm.org.apache.hadoop.fs.Path(temp_path)
-    fs_log = spark._jvm.org.apache.hadoop.fs.Path(log_path)
+    # === Split by operation & filter by status ===
+    df_failed = df_filtered.filter(col("status") == "Failed")
+    df_succeeded = df_filtered.filter(col("status") == "Succeeded")
 
-    if fs.exists(fs_temp):
-        if fs.exists(fs_log):
-            fs.delete(fs_log, True)
-        fs.rename(fs_temp, fs_log)
-        print(f"[LOG] SUCCESS: {base_table}_{operation} → {utc_dates}")
-    else:
-        raise ValueError("[ERROR] Temp path missing.")
+    operations_to_retry = df_failed.select(split(col("table_name"), "_").getItem(-1).alias("operation")) \
+                                   .distinct() \
+                                   .rdd.flatMap(lambda x: x).collect()
 
-finally:
-    fs.delete(lock_path_obj, False)
+    if not operations_to_retry:
+        # All operations succeeded for this table & UTC
+        mssparkutils.notebook.exit("EXIT")
+
+    # === Prepare result ===
+    meta = df_active.filter(col("TABLE_NAME") == table_name).collect()[0]
+    result = [
+        {
+            "table_name": meta["TABLE_NAME"],
+           
