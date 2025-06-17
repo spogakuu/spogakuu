@@ -83,7 +83,7 @@ if not utc_dates_to_log:
     print(f"[LOG] All UTCs already logged for {table_id}")
     mssparkutils.notebook.exit("NO-UTC-FOUND")
 
-# ==== Create log rows ====
+# ==== Create log rows (convert date → timestamp) ====
 log_rows = [
     Row(
         run_date=run_date,
@@ -91,7 +91,7 @@ log_rows = [
         operation=operation,
         status=status_val,
         error_message=error_msg,
-        UTCTimestamp=utc
+        UTCTimestamp=datetime.combine(utc, datetime.min.time())  # ✅ convert to timestamp
     ) for utc in utc_dates_to_log
 ]
 
@@ -114,7 +114,7 @@ try:
         df_existing = df_existing.filter(~(
             (col("table_name") == table_id) &
             (col("operation") == operation) &
-            (col("UTCTimestamp") == utc)
+            (col("UTCTimestamp") == datetime.combine(utc, datetime.min.time()))
         ))
 
     df_updated = df_existing.unionByName(spark.createDataFrame(log_rows, schema=schema))
