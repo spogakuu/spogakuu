@@ -37,25 +37,12 @@ schema = StructType([
 try:
     df = spark.read.parquet(input_path)
     raw_utc_dates = df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
-    print(f"[DEBUG] Raw UTC values: {raw_utc_dates}")
-
-    def safe_to_date(val):
-        if isinstance(val, datetime):
-            return val.date()
-        try:
-            return datetime.strptime(str(val), "%Y-%m-%d %H:%M:%S").date()
-        except:
-            return None
-
-    new_utc_dates = [safe_to_date(dt) for dt in raw_utc_dates if dt is not None]
-    new_utc_dates = [dt for dt in new_utc_dates if dt is not None]
-    print(f"[DEBUG] Parsed UTC dates: {new_utc_dates}")
-
+    new_utc_dates = [dt.date() if isinstance(dt, datetime) else None for dt in raw_utc_dates if dt is not None]
 except Exception as e:
     print(f"[ERROR] Failed to read UTCs from input: {str(e)}")
     new_utc_dates = []
 
-# ==== Read existing logs ====
+# ==== Read full existing logs ====
 try:
     df_existing = spark.read.schema(schema).parquet(log_path)
 except:
@@ -63,27 +50,23 @@ except:
 
 table_id = f"{base_table}_{operation}"
 
-# ==== Get already logged UTCs ====
+# ==== Find already logged UTCs for this table/operation ====
 existing_utc_set = df_existing.filter(
     (col("table_name") == table_id) &
     (col("operation") == operation)
 ).select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
 
-existing_utc_set = set([
-    dt.date() if isinstance(dt, datetime) else dt
-    for dt in existing_utc_set if dt is not None
-])
+existing_utc_set = set([dt.date() if isinstance(dt, datetime) else dt for dt in existing_utc_set if dt is not None])
 
-# ==== Determine new UTCs to log ====
+# ==== Filter only new UTCs ====
 utc_dates_to_log = [utc for utc in new_utc_dates if utc not in existing_utc_set]
-print(f"[DEBUG] Final UTCs to log: {utc_dates_to_log}")
 
-# ==== Exit if nothing to log ====
+# ==== Exit if nothing new to log ====
 if not utc_dates_to_log:
     print(f"[LOG] All UTCs already logged for {table_id}")
     mssparkutils.notebook.exit("NO-UTC-FOUND")
 
-# ==== Create log rows (convert date → timestamp) ====
+# ==== Create log rows ====
 log_rows = [
     Row(
         run_date=run_date,
@@ -91,7 +74,7 @@ log_rows = [
         operation=operation,
         status=status_val,
         error_message=error_msg,
-        UTCTimestamp=datetime.combine(utc, datetime.min.time())  # ✅ convert to timestamp
+        UTCTimestamp=utc
     ) for utc in utc_dates_to_log
 ]
 
@@ -108,18 +91,23 @@ while fs.exists(lock_path_obj):
 
 fs.create(lock_path_obj)
 
-# ==== Write logs ====
+# ==== Final write: remove matches from full log, union new rows, overwrite ====
 try:
+    # Remove matching (table, operation, UTC) from full log
     for utc in utc_dates_to_log:
         df_existing = df_existing.filter(~(
             (col("table_name") == table_id) &
             (col("operation") == operation) &
-            (col("UTCTimestamp") == datetime.combine(utc, datetime.min.time()))
+            (col("UTCTimestamp") == utc)
         ))
 
+    # Union full log with new entries
     df_updated = df_existing.unionByName(spark.createDataFrame(log_rows, schema=schema))
+
+    # Write to temp
     df_updated.write.mode("overwrite").parquet(temp_path)
 
+    # Atomic move
     fs_temp = spark._jvm.org.apache.hadoop.fs.Path(temp_path)
     fs_log = spark._jvm.org.apache.hadoop.fs.Path(log_path)
 
