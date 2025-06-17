@@ -7,8 +7,8 @@ from pyspark.sql.types import StructType, StructField, StringType, DateType, Tim
 from notebookutils import mssparkutils
 
 # ==== PARAMETERS ====
-base_table = table_name           # e.g., patient_current_demographics
-operation = operation             # e.g., INSERT
+base_table = table_name           # from pipeline
+operation = operation             # from pipeline
 status_val = "Succeeded"
 error_msg = ""
 
@@ -37,7 +37,20 @@ schema = StructType([
 try:
     df = spark.read.parquet(input_path)
     raw_utc_dates = df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
-    new_utc_dates = [dt.date() if isinstance(dt, datetime) else None for dt in raw_utc_dates if dt is not None]
+    print(f"[DEBUG] Raw UTC values: {raw_utc_dates}")
+
+    def safe_to_date(val):
+        if isinstance(val, datetime):
+            return val.date()
+        try:
+            return datetime.strptime(str(val), "%Y-%m-%d %H:%M:%S").date()
+        except:
+            return None
+
+    new_utc_dates = [safe_to_date(dt) for dt in raw_utc_dates if dt is not None]
+    new_utc_dates = [dt for dt in new_utc_dates if dt is not None]
+    print(f"[DEBUG] Parsed UTC dates: {new_utc_dates}")
+
 except Exception as e:
     print(f"[ERROR] Failed to read UTCs from input: {str(e)}")
     new_utc_dates = []
@@ -50,17 +63,22 @@ except:
 
 table_id = f"{base_table}_{operation}"
 
-# ==== Find already logged UTCs ====
+# ==== Get already logged UTCs ====
 existing_utc_set = df_existing.filter(
     (col("table_name") == table_id) &
     (col("operation") == operation)
 ).select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
-existing_utc_set = set([dt.date() if isinstance(dt, datetime) else dt for dt in existing_utc_set if dt is not None])
 
-# ==== Filter only new UTCs ====
+existing_utc_set = set([
+    dt.date() if isinstance(dt, datetime) else dt
+    for dt in existing_utc_set if dt is not None
+])
+
+# ==== Determine new UTCs to log ====
 utc_dates_to_log = [utc for utc in new_utc_dates if utc not in existing_utc_set]
+print(f"[DEBUG] Final UTCs to log: {utc_dates_to_log}")
 
-# ==== Exit if nothing new to log ====
+# ==== Exit if nothing to log ====
 if not utc_dates_to_log:
     print(f"[LOG] All UTCs already logged for {table_id}")
     mssparkutils.notebook.exit("NO-UTC-FOUND")
