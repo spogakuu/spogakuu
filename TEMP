@@ -65,9 +65,16 @@ def add_hash_column(df):
 
 # Logging
 def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0, error_message=""):
-    utc_ts_obj = datetime.strptime(utc_timestamp, "%Y-%m-%d")
+    print(f"🟡 Logging: {table_name}, Status: {status}, UTC: {utc_timestamp}, Count: {count}")
+    try:
+        utc_ts_obj = datetime.strptime(str(utc_timestamp), "%Y-%m-%d")
+    except Exception as e:
+        print(f"❌ Error parsing UTC timestamp: {e}")
+        return
+
     new_row = [(table_name, status, datetime.strptime(Today_date, "%Y-%m-%d").date(),
                 utc_ts_obj, start_time.isoformat(), end_time.isoformat(), count, error_message)]
+
     try:
         schema = spark.read.parquet(daily_log_path).schema
     except:
@@ -86,13 +93,21 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
     try:
         try:
             existing_df = spark.read.parquet(daily_log_path)
+            print(f"📊 Existing log count: {existing_df.count()}")
+
             filtered_df = existing_df.filter(~(
                 (col("table_name") == table_name) &
                 (col("load_date") == Today_date) &
-                (to_date("UTCTimestamp") == utc_timestamp)
+                (to_date("UTCTimestamp") == str(utc_timestamp))
             ))
+            print(f"🧹 Filtered log count: {filtered_df.count()}")
+
             final_df = filtered_df.unionByName(new_df)
-        except:
+            print("✅ Final log row:")
+            final_df.show()
+
+        except Exception as log_filter_ex:
+            print(f"⚠️ Fallback to new log only: {log_filter_ex}")
             final_df = new_df
 
         temp_daily_path = f"{daily_log_path}_temp_{uuid.uuid4()}"
@@ -104,6 +119,7 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
         if fs.exists(Path(daily_log_path)):
             fs.delete(Path(daily_log_path), True)
         fs.rename(Path(temp_daily_path), Path(daily_log_path))
+        print("🟢 Log updated successfully.")
 
     finally:
         release_lock()
@@ -131,6 +147,7 @@ def load_table(table_name, key_column):
 
         utc_dates = insert_df.select(date_format(col("UTCTimestamp"), "yyyy-MM-dd")) \
                              .distinct().rdd.flatMap(lambda x: x).collect()
+        print(f"📆 UTC Dates to process: {utc_dates}")
 
         for utc_day in utc_dates:
             print(f"Processing {table_name} for UTC date: {utc_day}")
@@ -145,12 +162,14 @@ def load_table(table_name, key_column):
 
             insert_count = insert_view.count() if not insert_view.rdd.isEmpty() else 0
             update_count = update_view.count() if update_view and not update_view.rdd.isEmpty() else 0
+            print(f"➡️ Insert count: {insert_count}, Update count: {update_count}")
 
             merged_view = insert_view.unionByName(update_view, allowMissingColumns=True) if update_view else insert_view
 
             if delete_view and not delete_view.rdd.isEmpty():
                 delete_keys = delete_view.select(col("row_number").alias(key_column)).distinct()
                 copy_table = copy_table.join(delete_keys, key_column, "left_anti")
+                print(f"🗑️ Applied delete filter for {delete_view.count()} rows")
 
             if not merged_view.rdd.isEmpty():
                 copy_table = copy_table.unionByName(merged_view, allowMissingColumns=True)
@@ -167,6 +186,7 @@ def load_table(table_name, key_column):
             if fs.exists(original_path):
                 fs.delete(original_path, True)
             fs.rename(temp_path, original_path)
+            print("💾 Snapshot written.")
 
             end_time = datetime.now()
             update_log(table_name, "I", utc_day, start_time, end_time, insert_count)
