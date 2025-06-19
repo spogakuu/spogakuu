@@ -126,14 +126,26 @@ def load_table(table_name, key_column):
             print(f"[SKIP] No insert data for {table_name}")
             return
 
-        utc_dates = insert_df.select(date_format(col("UTCTimestamp"), "yyyy-MM-dd")) \
-                             .distinct().rdd.flatMap(lambda x: x).collect()
+        # === Extract UTCs only not already in snapshot ===
+        incoming_utcs_df = insert_df.select(date_format(col("UTCTimestamp"), "yyyy-MM-dd").alias("utc_day")).distinct()
+        snapshot_df = safe_read_parquet(copy_table_path)
+        if snapshot_df:
+            existing_utcs_df = snapshot_df.select(date_format(col("UTCTimestamp"), "yyyy-MM-dd").alias("utc_day")).distinct()
+            new_utcs_df = incoming_utcs_df.subtract(existing_utcs_df)
+        else:
+            new_utcs_df = incoming_utcs_df
+        utc_dates = [row["utc_day"] for row in new_utcs_df.collect()]
+        if not utc_dates:
+            print(f"[SKIP] All UTCs already processed for {table_name}")
+            return
 
         for utc_day in utc_dates:
+
             copy_table = safe_read_parquet(copy_table_path)
             if not copy_table:
                 print(f"[SKIP] Snapshot missing for table: {table_name} on {utc_day}")
                 continue
+            print(f"[PROCESSING] Table: {table_name} | UTC: {utc_day}")
 
             insert_view = insert_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day)
             update_view = update_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day) if update_df else None
