@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sha2, concat_ws, when, lit, date_format, to_date
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit, date_format
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pytz
@@ -30,51 +30,52 @@ Today_date = datetime.now(tz).strftime("%Y-%m-%d")
 
 # Lock utility
 def acquire_lock():
+    print("[LOCK] Trying to acquire lock")
     if os.path.exists(lock_file):
+        print("[LOCK] Already acquired, waiting...")
         return False
     with open(lock_file, 'w') as f:
         f.write("locked")
+    print("[LOCK] Acquired")
     return True
 
 def release_lock():
     if os.path.exists(lock_file):
         os.remove(lock_file)
+        print("[LOCK] Released")
 
 # Safe parquet read
 def safe_read_parquet(path):
+    print(f"[READ] Reading path: {path}")
     if not mssparkutils.fs.exists(path):
-        print(f"[SKIP] Path missing: {path}")
+        print(f"[READ] Path not found: {path}")
         return None
     try:
-        spark.catalog.refreshByPath(path)
-        return spark.read.parquet(path)
+        df = spark.read.parquet(path)
+        print(f"[READ] Read successful: {path}")
+        return df
     except Exception as e:
-        print(f"[SKIP] Could not read {path}: {e}")
+        print(f"[ERROR] Reading failed for {path} - {e}")
         return None
 
 # Add ROW_HASH
-
 def add_hash_column(df):
-    cleaned_cols = [
-        when(col(c).isNull(), lit(" ")).otherwise(col(c).cast("string")).alias(c)
-        for c in df.columns
-    ]
+    print("[HASH] Adding ROW_HASH")
+    cleaned_cols = []
+    for field in df.schema.fields:
+        col_name = field.name
+        cleaned_col = when(col(col_name).isNull(), lit(" ")).otherwise(col(col_name).cast("string"))
+        cleaned_cols.append(cleaned_col.alias(col_name))
     temp_df = df.select(*cleaned_cols)
     row_hash_col = sha2(concat_ws("||", *temp_df.columns), 256).alias("ROW_HASH")
     return df.withColumn("ROW_HASH", row_hash_col)
 
 # Logging
 def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0, error_message=""):
-    print(f"🟡 Logging: {table_name}, Status: {status}, UTC: {utc_timestamp}, Count: {count}")
-    try:
-        utc_ts_obj = datetime.strptime(str(utc_timestamp), "%Y-%m-%d")
-    except Exception as e:
-        print(f"❌ Error parsing UTC timestamp: {e}")
-        return
-
+    print(f"[LOG] {table_name} | Status: {status} | UTC: {utc_timestamp} | Count: {count}")
+    utc_ts_obj = datetime.strptime(utc_timestamp, "%Y-%m-%d")
     new_row = [(table_name, status, datetime.strptime(Today_date, "%Y-%m-%d").date(),
                 utc_ts_obj, start_time.isoformat(), end_time.isoformat(), count, error_message)]
-
     try:
         schema = spark.read.parquet(daily_log_path).schema
     except:
@@ -82,7 +83,7 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
             schema = spark.read.parquet(main_log_path).schema
             spark.createDataFrame([], schema).write.mode("overwrite").parquet(daily_log_path)
         except Exception as ex:
-            print("Failed to initialize daily log:", ex)
+            print(f"[LOG ERROR] Cannot get schema: {ex}")
             return
 
     new_df = spark.createDataFrame(new_row, schema)
@@ -93,21 +94,11 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
     try:
         try:
             existing_df = spark.read.parquet(daily_log_path)
-            print(f"📊 Existing log count: {existing_df.count()}")
-
-            filtered_df = existing_df.filter(~(
-                (col("table_name") == table_name) &
-                (col("load_date") == Today_date) &
-                (to_date("UTCTimestamp") == str(utc_timestamp))
-            ))
-            print(f"🧹 Filtered log count: {filtered_df.count()}")
-
+            filtered_df = existing_df.filter(~((col("table_name") == table_name) &
+                                               (col("load_date") == Today_date) &
+                                               (col("UTCTimestamp") == utc_ts_obj)))
             final_df = filtered_df.unionByName(new_df)
-            print("✅ Final log row:")
-            final_df.show()
-
-        except Exception as log_filter_ex:
-            print(f"⚠️ Fallback to new log only: {log_filter_ex}")
+        except:
             final_df = new_df
 
         temp_daily_path = f"{daily_log_path}_temp_{uuid.uuid4()}"
@@ -119,8 +110,7 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
         if fs.exists(Path(daily_log_path)):
             fs.delete(Path(daily_log_path), True)
         fs.rename(Path(temp_daily_path), Path(daily_log_path))
-        print("🟢 Log updated successfully.")
-
+        print("[LOG] Log write complete")
     finally:
         release_lock()
 
@@ -128,7 +118,7 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
 def load_table(table_name, key_column):
     thread_name = threading.current_thread().name
     start_time = datetime.now()
-    print(f"START: [{start_time}] [Thread: {thread_name}] {table_name}")
+    print(f"\n[START] Table: {table_name} | Thread: {thread_name} | Time: {start_time}")
 
     try:
         copy_table_path = f"{copy_path}/{table_name}_INC"
@@ -141,35 +131,38 @@ def load_table(table_name, key_column):
         update_df = safe_read_parquet(update_path)
         delete_df = safe_read_parquet(delete_path)
 
-        if insert_df is None or insert_df.rdd.isEmpty():
-            print(f"[SKIP] Insert data missing or empty for: {table_name}")
+        if not insert_df:
+            print(f"[SKIP] No insert data for {table_name}")
             return
 
         utc_dates = insert_df.select(date_format(col("UTCTimestamp"), "yyyy-MM-dd")) \
                              .distinct().rdd.flatMap(lambda x: x).collect()
-        print(f"📆 UTC Dates to process: {utc_dates}")
+        print(f"[UTC-DATES] {utc_dates}")
 
         for utc_day in utc_dates:
-            print(f"Processing {table_name} for UTC date: {utc_day}")
-
+            print(f"\n[PROCESSING] {table_name} | UTC: {utc_day}")
             copy_table = safe_read_parquet(copy_table_path)
-            if copy_table is None:
-                copy_table = spark.createDataFrame([], insert_df.schema)
+            if not copy_table:
+                print(f"[SKIP] No snapshot for {table_name} on {utc_day}")
+                continue
 
             insert_view = insert_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day)
             update_view = update_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day) if update_df else None
             delete_view = delete_df.filter(date_format(col("UTCTimestamp"), "yyyy-MM-dd") == utc_day) if delete_df else None
 
-            insert_count = insert_view.count() if not insert_view.rdd.isEmpty() else 0
-            update_count = update_view.count() if update_view and not update_view.rdd.isEmpty() else 0
-            print(f"➡️ Insert count: {insert_count}, Update count: {update_count}")
+            insert_count = insert_view.count()
+            update_count = update_view.count() if update_view else 0
+            print(f"[COUNTS] Insert: {insert_count} | Update: {update_count}")
 
             merged_view = insert_view.unionByName(update_view, allowMissingColumns=True) if update_view else insert_view
+            print(f"[MERGE] Total rows to merge: {merged_view.count()}")
 
             if delete_view and not delete_view.rdd.isEmpty():
                 delete_keys = delete_view.select(col("row_number").alias(key_column)).distinct()
+                before = copy_table.count()
                 copy_table = copy_table.join(delete_keys, key_column, "left_anti")
-                print(f"🗑️ Applied delete filter for {delete_view.count()} rows")
+                after = copy_table.count()
+                print(f"[DELETE] Rows removed: {before - after}")
 
             if not merged_view.rdd.isEmpty():
                 copy_table = copy_table.unionByName(merged_view, allowMissingColumns=True)
@@ -180,13 +173,13 @@ def load_table(table_name, key_column):
             temp_path = spark._jvm.org.apache.hadoop.fs.Path(temp_table_path)
             if fs.exists(temp_path):
                 fs.delete(temp_path, True)
-            copy_table.write.mode("append").parquet(temp_table_path)
+            copy_table.write.mode("overwrite").parquet(temp_table_path)
 
             original_path = spark._jvm.org.apache.hadoop.fs.Path(copy_table_path)
             if fs.exists(original_path):
                 fs.delete(original_path, True)
             fs.rename(temp_path, original_path)
-            print("💾 Snapshot written.")
+            print(f"[WRITE] Snapshot updated for {table_name}")
 
             end_time = datetime.now()
             update_log(table_name, "I", utc_day, start_time, end_time, insert_count)
@@ -194,5 +187,61 @@ def load_table(table_name, key_column):
 
     except Exception as e:
         end_time = datetime.now()
-        print(f"{table_name} - Error: {e}")
+        print(f"[ERROR] Failed to process {table_name}")
+        print(traceback.format_exc())
         update_log(table_name, "FAILURE", Today_date, start_time, end_time, 0, traceback.format_exc())
+
+# === Load and Process Tables ===
+table_list_df = spark.read.parquet(table_list_path)
+active_tables_df = table_list_df.filter("STATUS = 'A'")
+active_tables = [(row["TABLE_NAME"], row["KEY_COLUMN"]) for row in active_tables_df.collect()]
+
+try:
+    main_log_df = spark.read.parquet(main_log_path)
+    failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
+    failed_today_tables = [row["table_name"] for row in failed_today_df.collect()]
+    logged_today = main_log_df.filter(f"load_date = '{Today_date}'").select("table_name").distinct().rdd.flatMap(lambda x: x).collect()
+
+    if failed_today_tables:
+        tables_to_run = [tbl for tbl in active_tables if tbl[0] in failed_today_tables]
+        print(f"[MODE] Retrying failed tables: {tables_to_run}")
+    elif set([x[0] for x in active_tables]).issubset(set(logged_today)):
+        tables_to_run = []
+        print("[MODE] All active tables already processed.")
+    else:
+        tables_to_run = active_tables
+        print("[MODE] Running all active tables.")
+except Exception as e:
+    print(f"[ERROR] Failed to read main log: {e}")
+    tables_to_run = active_tables
+
+if tables_to_run:
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(load_table, tbl, key): tbl for tbl, key in tables_to_run}
+        for future in as_completed(futures):
+            print("[THREAD COMPLETE]")
+
+# === Final Log Merge ===
+try:
+    main_log_df = spark.read.parquet(main_log_path)
+    daily_log_df = spark.read.parquet(daily_log_path)
+except:
+    print("[MERGE] Daily log not found, using empty DataFrame.")
+    daily_log_df = spark.createDataFrame([], main_log_df.schema)
+
+tables_today = [row["table_name"] for row in daily_log_df.select("table_name").distinct().collect()]
+cleaned_main_log_df = main_log_df.filter(~((col("load_date") == Today_date) & (col("table_name").isin(tables_today))))
+final_main_log_df = cleaned_main_log_df.unionByName(daily_log_df)
+
+temp_main_log_path = main_log_path + "_tmp"
+final_main_log_df.write.mode("overwrite").parquet(temp_main_log_path)
+
+fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+Path = spark._jvm.org.apache.hadoop.fs.Path
+if fs.exists(Path(main_log_path)):
+    fs.delete(Path(main_log_path), True)
+fs.rename(Path(temp_main_log_path), Path(main_log_path))
+if fs.exists(Path(daily_log_path)):
+    fs.delete(Path(daily_log_path), True)
+
+print("[COMPLETE] Final log updated and daily log cleaned.")
