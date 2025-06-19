@@ -1,0 +1,134 @@
+from datetime import datetime
+import pytz
+import time
+from pyspark.sql.functions import col
+from pyspark.sql import Row
+from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
+from notebookutils import mssparkutils
+
+# ==== PARAMETERS ====
+base_table = table_name          # from pipeline
+operation = operation            # from pipeline
+status_val = "Succeeded"
+error_msg = ""
+
+# ==== TIMEZONE ====
+tz = pytz.timezone("America/Chicago")
+now = datetime.now(tz)
+run_date = now.date()
+
+# ==== PATHS ====
+log_path = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS"
+temp_path = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS_TEMP"
+lock_file = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS_LOCK"
+input_path = f"Files/BRONZE/INCREMENTAL_LOAD/{base_table}_{operation}"
+
+# ==== LOG SCHEMA ====
+schema = StructType([
+    StructField("run_date", DateType(), True),
+    StructField("table_name", StringType(), True),
+    StructField("operation", StringType(), True),
+    StructField("status", StringType(), True),
+    StructField("error_message", StringType(), True),
+    StructField("UTCTimestamp", TimestampType(), True)
+])
+
+# ==== Read processed UTCs from current load ====
+try:
+    df = spark.read.parquet(input_path)
+    raw_utc_dates = df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
+    print(f"[DEBUG] Raw UTC values: {raw_utc_dates}")
+
+    def safe_to_date(val):
+        if isinstance(val, datetime):
+            return val.date()
+        try:
+            return datetime.strptime(str(val), "%Y-%m-%d %H:%M:%S").date()
+        except:
+            return None
+
+    new_utc_dates = [safe_to_date(dt) for dt in raw_utc_dates if dt is not None]
+    new_utc_dates = [dt for dt in new_utc_dates if dt is not None]
+    print(f"[DEBUG] Parsed UTC dates: {new_utc_dates}")
+
+except Exception as e:
+    print(f"[ERROR] Failed to read UTCs from input: {str(e)}")
+    new_utc_dates = []
+
+# ==== Read existing logs ====
+try:
+    df_existing = spark.read.schema(schema).parquet(log_path)
+except:
+    df_existing = spark.createDataFrame([], schema)
+
+table_id = f"{base_table}_{operation}"
+
+# ==== Get already logged UTCs ====
+existing_utc_set = df_existing.filter(
+    (col("table_name") == table_id) &
+    (col("operation") == operation)
+).select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
+
+existing_utc_set = set([
+    dt.date() if isinstance(dt, datetime) else dt
+    for dt in existing_utc_set if dt is not None
+])
+
+# ==== Determine new UTCs to log ====
+utc_dates_to_log = [utc for utc in new_utc_dates if utc not in existing_utc_set]
+print(f"[DEBUG] Final UTCs to log: {utc_dates_to_log}")
+
+# ==== Exit if nothing to log ====
+if not utc_dates_to_log:
+    print(f"[LOG] All UTCs already logged for {table_id}")
+    mssparkutils.notebook.exit("NO-UTC-FOUND")
+
+# ==== Create log rows (convert date → timestamp) ====
+log_rows = [
+    Row(
+        run_date=run_date,
+        table_name=table_id,
+        operation=operation,
+        status=status_val,
+        error_message=error_msg,
+        UTCTimestamp=datetime.combine(utc, datetime.min.time())  # ✅ convert to timestamp
+    ) for utc in utc_dates_to_log
+]
+
+# ==== Acquire Lock ====
+fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+lock_path_obj = spark._jvm.org.apache.hadoop.fs.Path(lock_file)
+start_time = time.time()
+timeout = 60
+
+while fs.exists(lock_path_obj):
+    if time.time() - start_time > timeout:
+        raise TimeoutError("[LOCK] Timeout waiting for STAGING_LOGS lock.")
+    time.sleep(5)
+
+fs.create(lock_path_obj)
+
+# ==== Write logs ====
+try:
+    for utc in utc_dates_to_log:
+        df_existing = df_existing.filter(~(
+            (col("table_name") == table_id) &
+            (col("operation") == operation) &
+            (col("UTCTimestamp") == datetime.combine(utc, datetime.min.time()))
+        ))
+
+    df_updated = df_existing.unionByName(spark.createDataFrame(log_rows, schema=schema))
+    df_updated.write.mode("overwrite").parquet(temp_path)
+
+    fs_temp = spark._jvm.org.apache.hadoop.fs.Path(temp_path)
+    fs_log = spark._jvm.org.apache.hadoop.fs.Path(log_path)
+
+    if fs.exists(fs_temp):
+        if fs.exists(fs_log):
+            fs.delete(fs_log, True)
+        fs.rename(fs_temp, fs_log)
+        print(f"[LOG] SUCCESS: {table_id} → {utc_dates_to_log}")
+    else:
+        raise ValueError("[ERROR] Temp path missing.")
+finally:
+    fs.delete(lock_path_obj, False)
