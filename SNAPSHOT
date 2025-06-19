@@ -1,7 +1,7 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, sha2, concat_ws, when, lit, date_format
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit, date_format, to_date
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 import threading
 import traceback
@@ -9,12 +9,20 @@ import os
 import uuid
 from notebookutils import mssparkutils
 
-# Initialize Spark
+# === INIT SPARK SESSION ===
 spark = SparkSession.builder.appName("Process Incremental Tables").getOrCreate()
+
+# === TIMEZONE SETTINGS ===
+# Ensure Spark reads/writes timestamps as UTC
+spark.conf.set("spark.sql.session.timeZone", "UTC")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
 spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
 spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+
+# === SET CST Load Date ===
+tz = pytz.timezone("America/Chicago")
+Today_date = datetime.now(tz).strftime("%Y-%m-%d")  # Used for load_date field in logs
 
 # Config Paths
 staging_path = "Files/BRONZE/INCREMENTAL_LOAD"
@@ -24,9 +32,6 @@ daily_log_path = "Files/BRONZE/SNAPSHOT/LOGS/Daily_Incremental_Logs"
 main_log_path = "Files/BRONZE/SNAPSHOT/LOGS/Final_Incremental_Logs"
 lock_file = "/tmp/update_log.lock"
 
-# Date
-tz = pytz.timezone("US/Central")
-Today_date = datetime.now(tz).strftime("%Y-%m-%d")
 
 def acquire_lock():
     if os.path.exists(lock_file):
@@ -59,14 +64,22 @@ def add_hash_column(df):
     row_hash_col = sha2(concat_ws("||", *temp_df.columns), 256).alias("ROW_HASH")
     return df.withColumn("ROW_HASH", row_hash_col)
 
-def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0, error_message=""):
-    print(f"[LOG] Updating log | Table: {table_name} | Status: {status} | UTC: {utc_timestamp} | Count: {count}")
-
+def update_log(table_name, status, utc_timestamp_str, start_time, end_time, count=0, error_message=""):
+    print(f"[LOG] Updating log | Table: {table_name} | Status: {status} | UTC: {utc_timestamp_str} | Count: {count}")
+    
     try:
-        utc_ts_obj = datetime.strptime(utc_timestamp, "%Y-%m-%d")
-        new_row = [(table_name, status, datetime.strptime(Today_date, "%Y-%m-%d").date(),
-                    utc_ts_obj, start_time.isoformat(), end_time.isoformat(), count, error_message)]
+        # === Parse UTC timestamp and construct datetime with UTC timezone ===
+        utc_date = datetime.strptime(utc_timestamp_str, "%Y-%m-%d").date()
+        utc_ts_full = datetime.combine(utc_date, datetime.min.time()).replace(tzinfo=timezone.utc)
 
+        # === Use CST timezone for the load date ===
+        run_date = datetime.now(pytz.timezone("America/Chicago")).date()
+
+        # === Create new row for logging ===
+        new_row = [(table_name, status, run_date, utc_ts_full,
+                    start_time.isoformat(), end_time.isoformat(), count, error_message)]
+
+        # === Load schema from daily or main log ===
         try:
             schema = spark.read.parquet(daily_log_path).schema
         except:
@@ -75,16 +88,18 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
 
         new_df = spark.createDataFrame(new_row, schema)
 
+        # === Acquire file lock ===
         while not acquire_lock():
             continue
 
         try:
             try:
                 existing_df = spark.read.parquet(daily_log_path)
+                # === Deduplicate based on table, date, UTC, status ===
                 filtered_df = existing_df.filter(~(
                     (col("table_name") == table_name) &
-                    (col("load_date") == Today_date) &
-                    (col("UTCTimestamp") == utc_ts_obj) &
+                    (col("load_date") == run_date) &
+                    (to_date(col("UTCTimestamp")) == utc_date) &
                     (col("status") == status)
                 ))
                 final_df = filtered_df.unionByName(new_df)
@@ -105,7 +120,6 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
     except Exception as e:
         print(f"[LOG ERROR] Failed to update log for {table_name} | Status: {status}")
         print(traceback.format_exc())
-
 
 # === Get unprocessed UTCs for a given table ===
 def get_unprocessed_utcs_for_table(table_name, log_df):
