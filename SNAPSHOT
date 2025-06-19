@@ -106,6 +106,22 @@ def update_log(table_name, status, utc_timestamp, start_time, end_time, count=0,
         print(f"[LOG ERROR] Failed to update log for {table_name} | Status: {status}")
         print(traceback.format_exc())
 
+
+# === Get unprocessed UTCs for a given table ===
+def get_unprocessed_utcs_for_table(table_name, log_df):
+    insert_path = f"{staging_path}/{table_name}_INSERT"
+    insert_df = safe_read_parquet(insert_path)
+    if not insert_df:
+        print(f"[SKIP] No insert data found for {table_name}")
+        return []
+    utc_dates_in_data = insert_df.select(date_format(col("UTCTimestamp"), "yyyy-MM-dd")) \
+                                 .distinct().rdd.flatMap(lambda x: x).collect()
+    logged_utcs = log_df.filter(col("table_name") == table_name) \
+                        .select("UTCTimestamp") \
+                        .rdd.flatMap(lambda x: x) \
+                        .map(lambda d: d.strftime("%Y-%m-%d")).distinct().collect()
+    return [utc for utc in utc_dates_in_data if utc not in logged_utcs]
+
 def load_table(table_name, key_column):
     thread_name = threading.current_thread().name
     start_time = datetime.now()
@@ -186,35 +202,53 @@ def load_table(table_name, key_column):
         print(traceback.format_exc())
         update_log(table_name, "FAILURE", Today_date, start_time, end_time, 0, traceback.format_exc())
 
-# === Load and Process Tables ===
+
+# === Load Active Tables ===
 table_list_df = spark.read.parquet(table_list_path)
 active_tables_df = table_list_df.filter("STATUS = 'A'")
 active_tables = [(row["TABLE_NAME"], row["KEY_COLUMN"]) for row in active_tables_df.collect()]
 
+# === Build table list by checking for unprocessed UTCs
+tables_to_run = []
+
 try:
     main_log_df = spark.read.parquet(main_log_path)
-    failed_today_df = main_log_df.filter(f"load_date = '{Today_date}' AND status = 'FAILURE'")
+    failed_today_df = main_log_df.filter((col("load_date") == Today_date) & (col("status") == "FAILURE"))
     failed_today_tables = [row["table_name"] for row in failed_today_df.collect()]
-    logged_today = main_log_df.filter(f"load_date = '{Today_date}'").select("table_name").distinct().rdd.flatMap(lambda x: x).collect()
 
     if failed_today_tables:
-        tables_to_run = [tbl for tbl in active_tables if tbl[0] in failed_today_tables]
-        print(f"[MODE] Retrying failed tables: {tables_to_run}")
-    elif set([x[0] for x in active_tables]).issubset(set(logged_today)):
-        tables_to_run = []
-        print("[MODE] All active tables already processed.")
+        print("[MODE] Retrying tables with failed UTCs only")
+        for table_name, key_column in active_tables:
+            if table_name in failed_today_tables:
+                utc_days = get_unprocessed_utcs_for_table(table_name, main_log_df)
+                if utc_days:
+                    tables_to_run.append((table_name, key_column))
     else:
-        tables_to_run = active_tables
-        print("[MODE] Running all active tables.")
-except Exception as e:
-    print(f"[ERROR] Failed to read main log: {e}")
-    tables_to_run = active_tables
+        print("[MODE] Checking all active tables for unprocessed UTCs")
+        for table_name, key_column in active_tables:
+            utc_days = get_unprocessed_utcs_for_table(table_name, main_log_df)
+            if utc_days:
+                tables_to_run.append((table_name, key_column))
 
+    if not tables_to_run:
+        print("[MODE] All tables already processed for today. Nothing to do.")
+except Exception as e:
+    print(f"[ERROR] Failed to read or evaluate main log: {e}")
+    for table_name, key_column in active_tables:
+        utc_days = get_unprocessed_utcs_for_table(table_name, spark.createDataFrame([], schema=None))
+        if utc_days:
+            tables_to_run.append((table_name, key_column))
+
+# === Threaded Execution per table (UTC logic is handled inside load_table)
 if tables_to_run:
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(load_table, tbl, key): tbl for tbl, key in tables_to_run}
+        futures = {
+            executor.submit(load_table, table, key): table
+            for table, key in tables_to_run
+        }
         for future in as_completed(futures):
             print("[THREAD COMPLETE]")
+
 
 # === Final Log Merge ===
 try:
