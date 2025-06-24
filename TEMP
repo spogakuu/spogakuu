@@ -59,7 +59,7 @@ def add_hash_column(df):
 
 def update_log(table_name, status, utc_timestamp_str, start_time, end_time, count=0, error_message=""):
     try:
-        utc_ts_full_str = f"{utc_timestamp_str}T00:00:00Z"
+        utc_ts_full_str = utc_timestamp_str
         run_date = datetime.now(pytz.timezone("America/Chicago")).date()
         new_row = [(table_name, status, run_date, utc_ts_full_str, start_time.isoformat(), end_time.isoformat(), count, error_message)]
 
