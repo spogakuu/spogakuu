@@ -1,0 +1,83 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from py4j.protocol import Py4JJavaError
+import threading
+
+# Initialize Spark
+spark = SparkSession.builder.appName("Initial Load Snapshot").getOrCreate()
+
+# Handle legacy date rebase issues in Spark 3.x+
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+
+# Paths
+table_list_path = "Files/TABLES_LIST"
+initial_path_root = "Files/BRONZE/INITIAL_LOAD"
+snapshot_path_root = "Files/BRONZE/SNAPSHOT/INCREMENTAL"
+
+# Function to add ROW_HASH (nulls replaced with space, types normalized to string)
+def add_hash_column(df):
+    cleaned_cols = []
+    for field in df.schema.fields:
+        col_name = field.name
+        cleaned_col = when(col(col_name).isNull(), lit(" ")).otherwise(col(col_name).cast("string"))
+        cleaned_cols.append(cleaned_col.alias(col_name))
+    
+    temp_df = df.select(*cleaned_cols)
+    row_hash_col = sha2(concat_ws("||", *temp_df.columns), 256).alias("ROW_HASH")
+    return df.withColumn("ROW_HASH", row_hash_col)
+
+# Load and process each table
+def load_table(table_name):
+    thread_name = threading.current_thread().name
+    print(f"\nSTART: [Thread: {thread_name}] {table_name}")
+
+    input_path = f"{initial_path_root}/{table_name}"
+    temp_path = f"{snapshot_path_root}/{table_name}_INC_TEMP"
+    final_path = f"{snapshot_path_root}/{table_name}_INC"
+
+    try:
+        # Read data
+        df = spark.read.parquet(input_path)
+        df_hashed = add_hash_column(df)
+
+        # File system operations
+        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+        temp_hadoop_path = spark._jvm.org.apache.hadoop.fs.Path(temp_path)
+        final_hadoop_path = spark._jvm.org.apache.hadoop.fs.Path(final_path)
+
+        # Delete temp if exists
+        if fs.exists(temp_hadoop_path):
+            fs.delete(temp_hadoop_path, True)
+
+        # Optional: reduce partitions to avoid too many output files
+        df_hashed = df_hashed.coalesce(1)
+
+        # Write to temp
+        df_hashed.write.mode("overwrite").parquet(temp_path)
+
+        # Replace final
+        if fs.exists(final_hadoop_path):
+            fs.delete(final_hadoop_path, True)
+        fs.rename(temp_hadoop_path, final_hadoop_path)
+
+        print(f"SUCCESS: {table_name} written to {final_path}")
+
+    except Py4JJavaError as jerr:
+        print(f"JAVA ERROR: {table_name} → {jerr.java_exception.getMessage()}")
+    except Exception as e:
+        print(f"FAILED: {table_name} → {e}")
+
+# Load active tables from table list
+table_list_df = spark.read.parquet(table_list_path)
+active_tables = [row["TABLE_NAME"] for row in table_list_df.filter("STATUS = 'A'").collect()]
+
+# Run all active tables using threads
+if active_tables:
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(load_table, tbl): tbl for tbl in active_tables}
+        for future in as_completed(futures):
+            print("LOOP END")
