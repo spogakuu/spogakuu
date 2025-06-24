@@ -124,6 +124,8 @@ def get_unprocessed_utcs_for_table(table_name, log_df, mode="ALL"):
                             .map(lambda d: d[:10]).distinct().collect()
         return [utc for utc in utc_dates_in_data if utc not in logged_utcs]
     
+
+
 def load_table(table_name, key_column):
     start_time_total = datetime.now()
     try:
@@ -135,22 +137,22 @@ def load_table(table_name, key_column):
         update_df = spark.read.parquet(f"{staging_path}/{table_name}_UPDATE")
         delete_df = spark.read.parquet(f"{staging_path}/{table_name}_DELETE")
 
-        insert_utcs = insert_df.select(substring(col("UTCTimestamp"), 1, 10).alias("utc_day")).distinct().rdd.flatMap(lambda x: x).collect()
-        update_utcs = update_df.select(substring(col("UTCTimestamp"), 1, 10).alias("utc_day")).distinct().rdd.flatMap(lambda x: x).collect()
-        delete_utcs = delete_df.select(substring(col("UTCTimestamp"), 1, 10).alias("utc_day")).distinct().rdd.flatMap(lambda x: x).collect()
+        insert_utcs = insert_df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
+        update_utcs = update_df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
+        delete_utcs = delete_df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
 
-        utc_days = sorted(set(insert_utcs + update_utcs + delete_utcs))
-        if not utc_days:
-            print(f"[SKIP] No UTCs found for {table_name}")
+        utc_timestamps = sorted(set(insert_utcs + update_utcs + delete_utcs))
+        if not utc_timestamps:
+            print(f"[SKIP] No UTC Timestamps found for {table_name}")
             return
 
-        for utc_day in utc_days:
+        for utc_timestamp_str in utc_timestamps:
             try:
                 copy_table = safe_read_parquet(copy_table_path)
                 if copy_table is None:
                     copy_table = spark.createDataFrame([], insert_df.schema.add("flag", "string"))
 
-                delete_view = delete_df.filter(substring(col("UTCTimestamp"), 1, 10) == utc_day)
+                delete_view = delete_df.filter(col("UTCTimestamp") == utc_timestamp_str)
                 if not delete_view.rdd.isEmpty():
                     active_history = copy_table.filter(col("flag") == "A")
                     delete_keys = delete_view.select(col("row_number").alias(key_column)).distinct()
@@ -159,8 +161,8 @@ def load_table(table_name, key_column):
                     copy_table = copy_table.unionByName(records_to_inactivate)
                     delete_view.write.mode("append").parquet(delete_storage_path)
 
-                insert_view = insert_df.filter(substring(col("UTCTimestamp"), 1, 10) == utc_day).withColumn("flag", lit("A"))
-                update_view = update_df.filter(substring(col("UTCTimestamp"), 1, 10) == utc_day).withColumn("flag", lit("A"))
+                insert_view = insert_df.filter(col("UTCTimestamp") == utc_timestamp_str).withColumn("flag", lit("A"))
+                update_view = update_df.filter(col("UTCTimestamp") == utc_timestamp_str).withColumn("flag", lit("A"))
                 merged_view = insert_view.unionByName(update_view, allowMissingColumns=True)
 
                 if not merged_view.rdd.isEmpty():
@@ -177,13 +179,14 @@ def load_table(table_name, key_column):
                 fs.rename(temp_path, final_path)
 
                 end_time = datetime.now()
-                update_log(table_name, "D", utc_day, start_time_total, end_time, delete_view.count())
-                update_log(table_name, "I", utc_day, start_time_total, end_time, insert_view.count())
-                update_log(table_name, "U", utc_day, start_time_total, end_time, update_view.count())
+                update_log(table_name, "D", utc_timestamp_str, start_time_total, end_time, delete_view.count())
+                update_log(table_name, "I", utc_timestamp_str, start_time_total, end_time, insert_view.count())
+                update_log(table_name, "U", utc_timestamp_str, start_time_total, end_time, update_view.count())
             except Exception as e:
-                update_log(table_name, "FAILURE", utc_day, start_time_total, datetime.now(), 0, traceback.format_exc())
+                update_log(table_name, "FAILURE", utc_timestamp_str, start_time_total, datetime.now(), 0, traceback.format_exc())
     except Exception as e:
         update_log(table_name, "FAILURE", Today_date, start_time_total, datetime.now(), 0, traceback.format_exc())
+
 
 # === Load Active Tables ===
 table_list_df = spark.read.parquet(table_list_path)
