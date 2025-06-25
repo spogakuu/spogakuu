@@ -1,61 +1,73 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 import time
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, count as f_count
 from pyspark.sql import Row
 from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
 from notebookutils import mssparkutils
 
-# ==== PARAMETERS ====
-base_table = table_name          # from pipeline
-operation = operation            # from pipeline
+# === INIT SPARK ===
+spark.conf.set("spark.sql.session.timeZone", "UTC")  # ✅ Ensures UTC is interpreted correctly
+
+# === PARAMETERS (from pipeline) ===
+base_table = table_name
+operation = operation
 status_val = "Succeeded"
 error_msg = ""
 
-# ==== TIMEZONE ====
-tz = pytz.timezone("America/Chicago")
-now = datetime.now(tz)
-run_date = now.date()
+# === TIMEZONE SETTINGS ===
+tz_cst = pytz.timezone("America/Chicago")
+run_date = datetime.now(tz_cst).date()  # ✅ run_date is CST
 
-# ==== PATHS ====
+# === PATHS ===
 log_path = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS"
 temp_path = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS_TEMP"
 lock_file = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS_LOCK"
 input_path = f"Files/BRONZE/INCREMENTAL_LOAD/{base_table}_{operation}"
 
-# ==== LOG SCHEMA ====
+# === LOG SCHEMA ===
 schema = StructType([
     StructField("run_date", DateType(), True),
     StructField("table_name", StringType(), True),
     StructField("operation", StringType(), True),
     StructField("status", StringType(), True),
     StructField("error_message", StringType(), True),
-    StructField("UTCTimestamp", TimestampType(), True)
+    StructField("UTCTimestamp", TimestampType(), True),
+    StructField("count", StringType(), True)  # ✅ New count field
 ])
 
-# ==== Read processed UTCs from current load ====
+# === Read distinct UTC timestamps from input table ===
 try:
     df = spark.read.parquet(input_path)
-    raw_utc_dates = df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
-    print(f"[DEBUG] Raw UTC values: {raw_utc_dates}")
+    raw_utc_values = df.select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
+    print(f"[DEBUG] Raw UTC values: {raw_utc_values}")
 
-    def safe_to_date(val):
+    def safe_to_utc_date(val):
         if isinstance(val, datetime):
-            return val.date()
+            return val.astimezone(timezone.utc).date()
         try:
-            return datetime.strptime(str(val), "%Y-%m-%d %H:%M:%S").date()
+            return datetime.strptime(str(val), "%Y-%m-%d %H:%M:%S").astimezone(timezone.utc).date()
         except:
             return None
 
-    new_utc_dates = [safe_to_date(dt) for dt in raw_utc_dates if dt is not None]
+    new_utc_dates = [safe_to_utc_date(dt) for dt in raw_utc_values if dt is not None]
     new_utc_dates = [dt for dt in new_utc_dates if dt is not None]
     print(f"[DEBUG] Parsed UTC dates: {new_utc_dates}")
-
 except Exception as e:
     print(f"[ERROR] Failed to read UTCs from input: {str(e)}")
     new_utc_dates = []
 
-# ==== Read existing logs ====
+# === Get row counts per UTC ===
+try:
+    df_count = df.withColumn("utc_date", col("UTCTimestamp").cast("date")) \
+                 .groupBy("utc_date").agg(f_count("*").alias("cnt"))
+    utc_count_dict = {row["utc_date"]: str(row["cnt"]) for row in df_count.collect()}
+    print(f"[DEBUG] UTC Counts: {utc_count_dict}")
+except Exception as e:
+    utc_count_dict = {}
+    print(f"[ERROR] Failed to calculate counts per UTC: {str(e)}")
+
+# === Read existing logs ===
 try:
     df_existing = spark.read.schema(schema).parquet(log_path)
 except:
@@ -63,10 +75,9 @@ except:
 
 table_id = f"{base_table}_{operation}"
 
-# ==== Get already logged UTCs ====
+# === Filter already logged UTCs ===
 existing_utc_set = df_existing.filter(
-    (col("table_name") == table_id) &
-    (col("operation") == operation)
+    (col("table_name") == table_id) & (col("operation") == operation)
 ).select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
 
 existing_utc_set = set([
@@ -74,16 +85,15 @@ existing_utc_set = set([
     for dt in existing_utc_set if dt is not None
 ])
 
-# ==== Determine new UTCs to log ====
+# === Determine new UTCs to log ===
 utc_dates_to_log = [utc for utc in new_utc_dates if utc not in existing_utc_set]
 print(f"[DEBUG] Final UTCs to log: {utc_dates_to_log}")
 
-# ==== Exit if nothing to log ====
 if not utc_dates_to_log:
     print(f"[LOG] All UTCs already logged for {table_id}")
     mssparkutils.notebook.exit("NO-UTC-FOUND")
 
-# ==== Create log rows (convert date → timestamp) ====
+# === Prepare new log rows ===
 log_rows = [
     Row(
         run_date=run_date,
@@ -91,11 +101,12 @@ log_rows = [
         operation=operation,
         status=status_val,
         error_message=error_msg,
-        UTCTimestamp=datetime.combine(utc, datetime.min.time())  # ✅ convert to timestamp
+        UTCTimestamp=datetime.combine(utc, datetime.min.time()).replace(tzinfo=timezone.utc),
+        count=utc_count_dict.get(utc, "0")
     ) for utc in utc_dates_to_log
 ]
 
-# ==== Acquire Lock ====
+# === Acquire lock ===
 fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
 lock_path_obj = spark._jvm.org.apache.hadoop.fs.Path(lock_file)
 start_time = time.time()
@@ -108,13 +119,13 @@ while fs.exists(lock_path_obj):
 
 fs.create(lock_path_obj)
 
-# ==== Write logs ====
+# === Write updated log ===
 try:
     for utc in utc_dates_to_log:
         df_existing = df_existing.filter(~(
             (col("table_name") == table_id) &
             (col("operation") == operation) &
-            (col("UTCTimestamp") == datetime.combine(utc, datetime.min.time()))
+            (col("UTCTimestamp") == datetime.combine(utc, datetime.min.time()).replace(tzinfo=timezone.utc))
         ))
 
     df_updated = df_existing.unionByName(spark.createDataFrame(log_rows, schema=schema))
