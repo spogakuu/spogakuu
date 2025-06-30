@@ -210,6 +210,8 @@ def get_unprocessed_utcs_for_table(table_name, log_df, mode="ALL"):
         print(traceback.format_exc())
         return []
 
+
+
 def load_table(table_name, key_column):
     start_time_total = datetime.now()
     try:
@@ -229,6 +231,26 @@ def load_table(table_name, key_column):
         utc_timestamps = sorted(set(insert_utcs + update_utcs + delete_utcs))
         if not utc_timestamps:
             print(f"[SKIP] No UTC timestamps found for {table_name}")
+            return
+
+        # ✅ Filter out already-processed UTCs from final log
+        try:
+            print("[DEBUG] Filtering out already-processed UTCs from main log...")
+            main_log_df = spark.read.parquet(main_log_path)
+            processed_utcs = main_log_df.filter(
+                (col("table_name") == table_name) & 
+                (col("status").isin("D", "I", "U"))
+            ).select("UTCTimestamp").distinct().rdd.flatMap(lambda x: x).collect()
+
+            before_count = len(utc_timestamps)
+            utc_timestamps = [utc for utc in utc_timestamps if utc not in set(processed_utcs)]
+            after_count = len(utc_timestamps)
+            print(f"[DEBUG] Skipped {before_count - after_count} UTCs already processed.")
+        except Exception as filter_err:
+            print(f"[WARN] Could not filter already-processed UTCs for table {table_name}. Proceeding with all.")
+
+        if not utc_timestamps:
+            print(f"[INFO] No remaining UTCs to process for {table_name} after filtering.")
             return
 
         for utc_timestamp_str in utc_timestamps:
@@ -283,6 +305,7 @@ def load_table(table_name, key_column):
         print(f"[FATAL] Failed completely while loading table {table_name}")
         print(traceback.format_exc())
         update_log(table_name, "FAILURE", Today_date, start_time_total, datetime.now(), 0, traceback.format_exc())
+
 
 # --- ACTIVE TABLES ---
 try:
