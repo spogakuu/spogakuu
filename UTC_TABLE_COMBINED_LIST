@@ -1,0 +1,73 @@
+from pyspark.sql.functions import col, lower, lit
+from pyspark.sql.types import StructType, StructField, StringType, DateType
+from datetime import datetime
+import pytz
+import json
+from notebookutils import mssparkutils
+
+# === CONFIGURATION ===
+table_list_path = "Files/TABLES_LIST"
+utc_path = "Files/BRONZE/STAGING_LOGS/UTC_TIMESTAMPS"
+log_path = "Files/BRONZE/STAGING_LOGS/STAGING_JOB_LOGS"
+
+# === TIMEZONE ===
+tz = pytz.timezone("America/Chicago")
+today = datetime.now(tz).date()
+
+# === Load active incremental tables ===
+df_all = spark.read.parquet(table_list_path)
+df_active = df_all.filter((col("STATUS") == "A") & (col("LOAD_TYPE") == "INCREMENTAL")) \
+                  .withColumn("table_name_lower", lower(col("TABLE_NAME")))
+
+# === Load UTC timestamps ===
+df_utcs = spark.read.parquet(utc_path)
+
+# === Cross join to get all (table_name, UTCTimestamp) combinations ===
+df_combo = df_active.crossJoin(df_utcs)
+
+# === Load STAGING_JOB_LOGS or create an empty one if missing ===
+try:
+    df_log = spark.read.parquet(log_path)
+except:
+    schema = StructType([
+        StructField("run_date", DateType(), True),
+        StructField("table_name", StringType(), True),
+        StructField("operation", StringType(), True),
+        StructField("status", StringType(), True),
+        StructField("error_message", StringType(), True),
+        StructField("UTCTimestamp", DateType(), True)  # ✅ Schema match
+    ])
+    df_log = spark.createDataFrame([], schema)
+    df_log.write.mode("overwrite").parquet(log_path)
+
+# === Normalize case in logs and prepare for join ===
+df_log = df_log.withColumn("table_name_lower", lower(col("table_name"))) \
+               .select("table_name_lower", "UTCTimestamp").distinct()
+
+# === Anti-join to get unprocessed (table, UTCTimestamp) pairs ===
+df_pending = df_combo.join(
+    df_log,
+    on=[(df_combo["table_name_lower"] == df_log["table_name_lower"]) &
+        (df_combo["UTCTimestamp"] == df_log["UTCTimestamp"])],
+    how="left_anti"
+)
+
+# === Prepare final result ===
+df_result = df_pending.select(
+    col("TABLE_NAME").alias("table_name"),
+    col("KEY_COLUMN").alias("key_column"),
+    col("STATUS").alias("status"),
+    col("DATABASE").alias("database"),
+    col("SCHEMA").alias("schema"),
+    lit("ALL").alias("operation"),
+    col("UTCTimestamp").cast("string")  # Keep name unchanged
+)
+
+# === Collect as dictionary ===
+result = [row.asDict() for row in df_result.collect()]
+
+# === Final output ===
+if not result:
+    mssparkutils.notebook.exit("EXIT")
+
+mssparkutils.notebook.exit(json.dumps(result))
