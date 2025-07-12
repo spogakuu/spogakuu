@@ -1,88 +1,61 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, sha2, concat_ws, when, lit
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from py4j.protocol import Py4JJavaError
-import threading
 
-# === Initialize Spark Session ===
-spark = SparkSession.builder.appName("Initial Load Snapshot").getOrCreate()
+# -------------------------
+# CONFIGURATION — CHANGE THESE ONLY
+# -------------------------
+SOURCE_TABLE = ""
+TARGET_TABLE = ""
+TEMP_TABLE = TARGET_TABLE + "_TEMP"
+FLAG_VALUE = "A"  # Set to 'I', 'U', or 'D' as needed
+# -------------------------
 
-# === Handle legacy datetime compatibility ===
-spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
-spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
-spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
-spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+# Initialize Spark
+spark = SparkSession.builder.appName("History Snapshot Load").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "UTC")
 
-# === Path Configuration ===
-table_list_path = "Files/TABLES_LIST"
-initial_path_root = "Files/BRONZE/INITIAL_LOAD"
-snapshot_path_root = "Files/BRONZE/HISTORY/FULL_HISTORY"
+# Function to prepare the snapshot table
+def prepare_history_snapshot(df, flag_value):
+    # Cast utctimestamp to string
+    if "utctimestamp" in df.columns:
+        df = df.withColumn("utctimestamp", col("utctimestamp").cast("string"))
 
-# === Add ROW_HASH column to a DataFrame ===
-def add_hash_column(df):
+    # Add 'flag' column
+    df = df.withColumn("flag", lit(flag_value))
+
+    # Create null-safe string-casted version of all columns for hashing
     cleaned_cols = []
     for field in df.schema.fields:
         col_name = field.name
         cleaned_col = when(col(col_name).isNull(), lit(" ")).otherwise(col(col_name).cast("string"))
         cleaned_cols.append(cleaned_col.alias(col_name))
-    
+
     temp_df = df.select(*cleaned_cols)
     row_hash_col = sha2(concat_ws("||", *temp_df.columns), 256).alias("ROW_HASH")
+
     return df.withColumn("ROW_HASH", row_hash_col)
 
-# === Main function to process each table ===
-def load_table(table_name):
-    thread_name = threading.current_thread().name
-    print(f"\nSTART: [Thread: {thread_name}] {table_name}")
+# Load → Transform → Write Temp → Rename to Final
+try:
+    print(f"\nSTART processing: {SOURCE_TABLE}")
 
-    input_path = f"{initial_path_root}/{table_name}"
-    temp_path = f"{snapshot_path_root}/{table_name}_HIST_TEMP"
-    final_path = f"{snapshot_path_root}/{table_name}_HIST"
+    # Read source data
+    df = spark.read.table(SOURCE_TABLE)
 
-    try:
-        # Read initial data
-        df = spark.read.parquet(input_path)
+    # Transform: cast utctimestamp, add flag, and hash
+    df_final = prepare_history_snapshot(df, FLAG_VALUE).coalesce(1)
 
-        # Add 'flag' column as 'A' (Active)
-        df = df.withColumn("flag", lit("A"))
+    # Drop temp table if exists
+    spark.sql(f"DROP TABLE IF EXISTS {TEMP_TABLE}")
 
-        # Add ROW_HASH column
-        df_hashed = add_hash_column(df)
+    # Write to temp table
+    df_final.write.mode("overwrite").saveAsTable(TEMP_TABLE)
 
-        # Hadoop FileSystem
-        fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-        temp_hadoop_path = spark._jvm.org.apache.hadoop.fs.Path(temp_path)
-        final_hadoop_path = spark._jvm.org.apache.hadoop.fs.Path(final_path)
+    # Replace target table atomically
+    spark.sql(f"DROP TABLE IF EXISTS {TARGET_TABLE}")
+    spark.sql(f"ALTER TABLE {TEMP_TABLE} RENAME TO {TARGET_TABLE}")
 
-        # Delete TEMP path if exists
-        if fs.exists(temp_hadoop_path):
-            fs.delete(temp_hadoop_path, True)
+    print(f"SUCCESS: {TARGET_TABLE} created with ROW_HASH, flag='{FLAG_VALUE}', and utctimestamp as string")
 
-        # Reduce partitions (optional)
-        df_hashed = df_hashed.coalesce(1)
-
-        # Write to TEMP
-        df_hashed.write.mode("overwrite").parquet(temp_path)
-
-        # Replace FINAL with TEMP
-        if fs.exists(final_hadoop_path):
-            fs.delete(final_hadoop_path, True)
-        fs.rename(temp_hadoop_path, final_hadoop_path)
-
-        print(f"SUCCESS: {table_name} written to {final_path}")
-
-    except Py4JJavaError as jerr:
-        print(f"JAVA ERROR: {table_name} → {jerr.java_exception.getMessage()}")
-    except Exception as e:
-        print(f"FAILED: {table_name} → {e}")
-
-# === Load active tables list ===
-table_list_df = spark.read.parquet(table_list_path)
-active_tables = [row["TABLE_NAME"] for row in table_list_df.filter("STATUS = 'A'").collect()]
-
-# === Run in Thread Pool ===
-if active_tables:
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(load_table, tbl): tbl for tbl in active_tables}
-        for future in as_completed(futures):
-            print("LOOP END")
+except Exception as e:
+    print(f"FAILED: {e}")
