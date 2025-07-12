@@ -212,8 +212,7 @@ def load_table(table_name, key_column):
                 #print(f"[UTC DONE] {utc} | Insert Count: {insert_count}")
 
                 update_log(table_name, "I", utc, start_time_total, end_time, insert_count, "")
-
-                #update_log(table_name, "I", utc, start_time_total, end_time, 8, "")
+                update_log(table_name, "U", utc, start_time_total, end_time, update_view.count(),"")
 
             except Exception as e:
                 print(f"[ERROR] Failed to process UTC: {utc} for table: {table_name}")
