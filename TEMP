@@ -9,9 +9,13 @@ import os
 import uuid
 import traceback
 
-# --- INIT SPARK ---
+# === INIT SPARK SESSION ===
 spark = SparkSession.builder.appName("Process Incremental Tables").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
 
 # --- CONFIG ---
 tz = pytz.timezone("America/Chicago")
@@ -43,30 +47,25 @@ def safe_read_table(table_name):
 
 def update_log(table_name, status, utc_timestamp_str, start_time, end_time, count="0", error_message=""):
     print(f"[LOG] Updating log for table: {table_name}, status: {status}, UTC: {utc_timestamp_str}")
+
     run_date = datetime.now(pytz.timezone("America/Chicago")).date()
-    new_row = [(table_name, status, run_date, utc_timestamp_str, start_time.isoformat(), end_time.isoformat(), count, error_message)]
 
-    try:
-        schema = spark.read.table("Daily_Incremental_Logs").schema
-    except:
-        print("[WARNING] Daily_Incremental_Logs table not found. Creating from fallback or default.")
-        try:
-            schema = spark.read.table("Final_Incremental_Logs").schema
-            spark.createDataFrame([], schema).write.mode("overwrite").saveAsTable("Daily_Incremental_Logs")
-        except:
-            traceback.print_exc()
-            schema = StructType([
-                StructField("table_name", StringType(), True),
-                StructField("status", StringType(), True),
-                StructField("load_date", DateType(), True),
-                StructField("UTCTimestamp", StringType(), True),
-                StructField("start_time", StringType(), True),
-                StructField("end_time", StringType(), True),
-                StructField("count", StringType(), True),
-                StructField("error_message", StringType(), True),
-            ])
-            spark.createDataFrame([], schema).write.mode("overwrite").saveAsTable("Daily_Incremental_Logs")
+    new_row = [(str(table_name), 
+                str(status), 
+                run_date,
+                str(utc_timestamp_str),
+                str(start_time.isoformat()), 
+                str(end_time.isoformat()), 
+                str(count), 
+                str(error_message))
+                ]
 
+    print(f"LOG_NEW_ROW: {new_row}")
+
+    df_logs = spark.read.table("daily_history_logs")
+    df_logs.printSchema()
+
+    schema = spark.read.table("daily_history_logs").schema
     new_df = spark.createDataFrame(new_row, schema)
 
     def acquire_lock(timeout=30):
@@ -86,7 +85,7 @@ def update_log(table_name, status, utc_timestamp_str, start_time, end_time, coun
 
     try:
         try:
-            existing_df = spark.read.table("Daily_Incremental_Logs")
+            existing_df = spark.read.table("daily_history_logs")
             filtered_df = existing_df.filter(~(
                 (col("table_name") == table_name) &
                 (col("load_date") == run_date) &
@@ -97,15 +96,19 @@ def update_log(table_name, status, utc_timestamp_str, start_time, end_time, coun
         except:
             final_df = new_df
 
-        final_df.write.mode("overwrite").saveAsTable("Daily_Incremental_Logs")
+        final_df.write.mode("overwrite").saveAsTable("daily_history_logs")
         print("[LOG] Log updated successfully.")
+        
     except Exception:
         print("[ERROR] Exception in update_log()")
         traceback.print_exc()
     finally:
         release_lock()
+
 def get_unprocessed_utcs_for_table(table_name, log_df, mode="ALL"):
+
     print(f"[DEBUG] Getting unprocessed UTCs for: {table_name} | Mode: {mode}")
+
     try:
         insert_df = safe_read_table(f"{table_name}_INSERT")
         if insert_df is None:
@@ -126,100 +129,146 @@ def get_unprocessed_utcs_for_table(table_name, log_df, mode="ALL"):
             unprocessed = [utc for utc in utc_dates if utc not in logged_utcs]
             print(f"[DEBUG] Unprocessed UTCs: {unprocessed}")
             return unprocessed
+
     except Exception as e:
         print(f"[ERROR] Failed in get_unprocessed_utcs_for_table for {table_name}")
         traceback.print_exc()
         return []
 
 def load_table(table_name, key_column):
+    from pyspark.sql.functions import col, lit
+    from datetime import datetime
+    import traceback
+
     start_time_total = datetime.now()
-    print(f"[START] Processing table: {table_name}")
+    print(f"\n====== [START] Loading table: {table_name} ======")
 
     try:
-        copy_table_name = f"{table_name}_INC"
+        copy_table_name = f"{table_name}_HIST"
         temp_table_name = f"{copy_table_name}_TMP"
+        delete_table_name = f"{table_name}_HIST_DELETE"
+        delete_temp_table_name = f"{delete_table_name}_TMP"
 
+        # Read Delta-based staging tables
         insert_df = spark.read.table(f"{table_name}_INSERT")
         update_df = spark.read.table(f"{table_name}_UPDATE")
         delete_df = spark.read.table(f"{table_name}_DELETE")
         print("[INFO] Loaded INSERT, UPDATE, DELETE staging data")
 
+        # Extract UTC timestamps
         utc_timestamps = sorted(set(
             insert_df.select("UTCTimestamp").rdd.flatMap(lambda x: x).collect() +
             update_df.select("UTCTimestamp").rdd.flatMap(lambda x: x).collect() +
             delete_df.select("UTCTimestamp").rdd.flatMap(lambda x: x).collect()
         ))
-        print(f"[INFO] UTCs to process for {table_name}: {utc_timestamps}")
-
-        try:
-            main_log_df = spark.read.table("Final_Incremental_Logs")
-            processed_utcs = main_log_df.filter(
-                (col("table_name") == table_name) & (col("status").isin("D", "I", "U"))
-            ).select("UTCTimestamp").rdd.flatMap(lambda x: x).collect()
-            utc_timestamps = [utc for utc in utc_timestamps if utc not in processed_utcs]
-        except:
-            print("[INFO] Final log unavailable or no previously processed UTCs")
 
         if not utc_timestamps:
-            print(f"[INFO] No new UTCs to process for table: {table_name}")
+            print(f"[SKIP] No UTC timestamps found for {table_name}")
             return
 
+        # Filter out already processed UTCs
+        try:
+            main_log_df = spark.read.table("history_final_logs")
+            processed_utcs = main_log_df.filter(
+                (col("table_name") == table_name) & col("status").isin("D", "I", "U")
+            ).select("UTCTimestamp").rdd.flatMap(lambda x: x).collect()
+            utc_timestamps = [utc for utc in utc_timestamps if utc not in set(processed_utcs)]
+        except:
+            print("[INFO] Log table not found. Proceeding with all UTCs.")
+
+        if not utc_timestamps:
+            print(f"[INFO] No new UTCs to process for {table_name}")
+            return
+
+        # Load or initialize the main history table
         try:
             copy_table = spark.read.table(copy_table_name)
         except:
             copy_table = spark.createDataFrame([], insert_df.schema.add("flag", "string"))
-            print("[INFO] Initialized new copy table for", copy_table_name)
+            print(f"[INFO] Initialized empty history table: {copy_table_name}")
 
         for utc in utc_timestamps:
-            print(f"[UTC START] {utc} | Table: {table_name}")
+            print(f"\n-- [PROCESSING] {table_name} | UTC: {utc} --")
             try:
-                insert_view = insert_df.filter(col("UTCTimestamp") == utc)
-                update_view = update_df.filter(col("UTCTimestamp") == utc)
+                insert_view = insert_df.filter(col("UTCTimestamp") == utc).withColumn("flag", lit("A"))
+                update_view = update_df.filter(col("UTCTimestamp") == utc).withColumn("flag", lit("A"))
                 delete_view = delete_df.filter(col("UTCTimestamp") == utc)
 
-                merged_view = insert_view.unionByName(update_view, allowMissingColumns=True) if not update_view.rdd.isEmpty() else insert_view
-
-                if delete_view and not delete_view.rdd.isEmpty():
+                # Handle deletes
+                if not delete_view.rdd.isEmpty():
+                    print("[INFO] Processing deletes with key-based lookup...")
+                    active_records = copy_table.filter(col("flag") == "A")
                     delete_keys = delete_view.select(col("row_number").alias(key_column)).distinct()
-                    copy_table = copy_table.join(delete_keys, key_column, "left_anti")
 
+                    records_to_inactivate = active_records.join(delete_keys, key_column, "inner") \
+                                                          .drop("flag").withColumn("flag", lit("I"))
+
+                    # Append to history (with flag = 'I')
+                    copy_table = copy_table.unionByName(records_to_inactivate)
+
+                    # Ensure delete table exists
+                    try:
+                        spark.sql(f"""
+                            CREATE TABLE IF NOT EXISTS {delete_table_name}
+                            USING DELTA AS SELECT * FROM delete_view WHERE 1 = 0
+                        """)
+                    except:
+                        pass
+
+                    try:
+                        # Read existing delete table (or empty)
+                        try:
+                            existing_delete_df = spark.read.table(delete_table_name)
+                        except:
+                            existing_delete_df = spark.createDataFrame([], delete_view.schema)
+
+                        # Combine new delete_view and existing
+                        combined_df = existing_delete_df.unionByName(delete_view, allowMissingColumns=True)
+
+                        # Write combined to temp table
+                        combined_df.write.mode("overwrite").saveAsTable(delete_temp_table_name)
+
+                        # Atomic swap
+                        spark.sql(f"DROP TABLE IF EXISTS {delete_table_name}")
+                        spark.sql(f"ALTER TABLE {delete_temp_table_name} RENAME TO {delete_table_name}")
+
+                        print(f"[INFO] Appended delete trigger rows to {delete_table_name} (via temp + rename)")
+
+                    except Exception as delete_err:
+                        print(f"[ERROR] Failed updating {delete_table_name}")
+                        print(traceback.format_exc())
+
+                # Handle inserts + updates
+                merged_view = insert_view.unionByName(update_view, allowMissingColumns=True)
                 if not merged_view.rdd.isEmpty():
+                    print("[INFO] Appending inserts/updates...")
                     copy_table = copy_table.unionByName(merged_view, allowMissingColumns=True)
+                    copy_table = add_hash_column(copy_table)
 
-                # Add ROW_HASH
-                copy_table = add_hash_column(copy_table)
-
-                # Write to temporary table first
+                # Write to temp history table and replace main
                 copy_table.write.mode("overwrite").saveAsTable(temp_table_name)
+                spark.sql(f"DROP TABLE IF EXISTS {copy_table_name}")
+                spark.sql(f"ALTER TABLE {temp_table_name} RENAME TO {copy_table_name}")
+                print(f"[INFO] Updated history table: {copy_table_name}")
 
-                # MERGE into main copy table
-                merge_query = f"""
-                MERGE INTO {copy_table_name} AS target
-                USING {temp_table_name} AS source
-                ON target.{key_column} = source.{key_column}
-                WHEN MATCHED THEN UPDATE SET *
-                WHEN NOT MATCHED THEN INSERT *
-                """
-                spark.sql(merge_query)
-
-                # Clean up temp table
-                spark.sql(f"DROP TABLE IF EXISTS {temp_table_name}")
-
+                # Log all 3 operations
                 end_time = datetime.now()
-                insert_count = insert_view.count()
+                update_log(table_name, "D", utc, start_time_total, end_time, delete_view.count())
+                update_log(table_name, "I", utc, start_time_total, end_time, insert_view.count())
+                update_log(table_name, "U", utc, start_time_total, end_time, update_view.count())
 
-                print(f"[UTC DONE] {utc} | Insert Count: {insert_count}")
-                update_log(table_name, "I", utc, start_time_total, end_time, str(insert_count), "")
+            except Exception as inner_e:
+                print(f"[ERROR] UTC {utc} failed for table {table_name}")
+                print(traceback.format_exc())
+                update_log(table_name, "FAILURE", utc, start_time_total, datetime.now(), 0, traceback.format_exc())
 
-            except Exception:
-                print(f"[ERROR] Failed to process UTC: {utc} for table: {table_name}")
-                traceback.print_exc()
-                update_log(table_name, "FAILURE", utc, start_time_total, datetime.now(), "0", "ERROR")
+        print(f"\n====== [COMPLETE] Table processed: {table_name} ======")
 
-    except Exception:
-        print(f"[ERROR] Outer failure in load_table for {table_name}")
-        traceback.print_exc()
-        update_log(table_name, "FAILURE", "", start_time_total, datetime.now(), "0", "ERROR")
+    except Exception as e:
+        print(f"[FATAL] Table load failed: {table_name}")
+        print(traceback.format_exc())
+        update_log(table_name, "FAILURE", datetime.utcnow().isoformat(), start_time_total, datetime.now(), 0, traceback.format_exc())
+
 
 
 # --- MAIN EXECUTION ---
@@ -234,7 +283,7 @@ except:
     raise RuntimeError("Failed to load active table list.")
 
 try:
-    main_log_df = spark.read.table("Final_Incremental_Logs")
+    main_log_df = spark.read.table("final_history_logs")
 except:
     print("[INFO] Final log not found. Initializing empty DataFrame.")
     empty_schema = StructType([
@@ -271,8 +320,8 @@ else:
 
 # --- MERGE FINAL LOG ---
 try:
-    main_log_df = spark.read.table("Final_Incremental_Logs")
-    daily_log_df = spark.read.table("Daily_Incremental_Logs")
+    main_log_df = spark.read.table("final_history_logs")
+    daily_log_df = spark.read.table("daily_history_logs")
 except:
     print("[WARNING] Log table read failed. Initializing empty.")
     daily_log_df = spark.createDataFrame([], main_log_df.schema)
@@ -285,9 +334,9 @@ final_main_log_df = cleaned_main_log_df.unionByName(daily_log_df)
 
 display(final_main_log_df)
 
-final_main_log_df.write.mode("overwrite").saveAsTable("Final_Incremental_Logs")
+final_main_log_df.write.mode("overwrite").saveAsTable("final_history_logs")
 
-spark.sql("DROP TABLE IF EXISTS Daily_Incremental_Logs")
-spark.sql("CREATE TABLE Daily_Incremental_Logs AS SELECT * FROM Final_Incremental_Logs WHERE 1=0")
+spark.sql("DROP TABLE IF EXISTS daily_history_logs")
+spark.sql("CREATE TABLE daily_history_logs AS SELECT * FROM final_history_logs WHERE 1=0")
 
 print("[INFO] Execution finished.")
