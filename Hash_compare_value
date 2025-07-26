@@ -1,0 +1,79 @@
+from pyspark.sql.functions import col, concat_ws, when, lit, trim, md5
+from pyspark.sql.types import StringType
+import hashlib
+
+# --- Step 1: Define table names and target key ---
+table_inc = "patient_current_demographics_inc"
+table_raw = "patient_current_demographics_RAW"
+target_id = "1||941027"
+key_column = "patient_current_demographics"
+exclude_cols = {"ROW_HASH", "INSERT_TIMESTAMP", "UTCTimestamp", "STATUS","row_hash"}
+
+from pyspark.sql.functions import regexp_replace, col, concat_ws, when, lit, trim, md5
+
+def add_hash_column_md5(df):
+    cleaned_cols = [
+        regexp_replace(
+            when(col(f.name).isNull(), lit("")).otherwise(trim(col(f.name).cast("string"))),
+            r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]',  # Remove control/invisible characters
+            ""
+        ).alias(f.name)
+        for f in df.schema.fields if f.name not in exclude_cols
+    ]
+    temp_df = df.select(*cleaned_cols)
+    sorted_cols = sorted(temp_df.columns)
+    hash_input_col = concat_ws("||", *[col(c) for c in sorted_cols]).alias("HASH_INPUT")
+    return temp_df.withColumn("HASH_INPUT", hash_input_col).withColumn("ROW_HASH", md5(col("HASH_INPUT")))
+
+# --- Step 3: Read data for the target key ---
+df_inc = spark.sql(f"SELECT * FROM {table_inc} WHERE {key_column} = '{target_id}'")
+df_raw = spark.sql(f"SELECT * FROM {table_raw} WHERE {key_column} = '{target_id}'")
+
+# --- Step 4: Generate hashes and add source label ---
+df_inc_hashed = add_hash_column_md5(df_inc).withColumn("SOURCE", lit("INC"))
+df_raw_hashed = add_hash_column_md5(df_raw).withColumn("SOURCE", lit("RAW"))
+
+# --- Step 5: Show side-by-side hash values ---
+df_joined = df_inc_hashed.select(key_column, "ROW_HASH", "SOURCE") \
+    .unionByName(df_raw_hashed.select(key_column, "ROW_HASH", "SOURCE"))
+df_joined.show(truncate=False)
+
+# --- Step 6: Classification logic + column-wise diff ---
+if df_raw.count() == 0 and df_inc.count() > 0:
+    print("INSERT: Record exists in INC but not in RAW")
+elif df_raw.count() > 0 and df_inc.count() > 0:
+    hash_raw = df_raw_hashed.select("ROW_HASH").collect()[0][0]
+    hash_inc = df_inc_hashed.select("ROW_HASH").collect()[0][0]
+    if hash_raw != hash_inc:
+        print("UPDATE: Hash mismatch detected — running column-level comparison...\n")
+        raw_row = df_raw_hashed.drop("HASH_INPUT", "ROW_HASH", "SOURCE").collect()[0].asDict()
+        inc_row = df_inc_hashed.drop("HASH_INPUT", "ROW_HASH", "SOURCE").collect()[0].asDict()
+
+
+        print("===== INC HASH INPUT =====")
+        df_inc_hashed.select("HASH_INPUT").show(truncate=False)
+
+        print("===== RAW HASH INPUT =====")
+        df_raw_hashed.select("HASH_INPUT").show(truncate=False)
+
+        diffs_found = False
+        for col_name in raw_row:
+            raw_val = raw_row[col_name]
+            inc_val = inc_row[col_name]
+
+            # Normalize both values to string and strip spaces
+            raw_val_str = "" if raw_val is None else str(raw_val).strip()
+            inc_val_str = "" if inc_val is None else str(inc_val).strip()
+
+            if raw_val_str != inc_val_str:
+                print(f"DIFF in '{col_name}': RAW = [{repr(raw_val)}] | INC = [{repr(inc_val)}]")
+                diffs_found = True
+
+        if not diffs_found:
+            print("No visible differences found — likely caused by encoding or hidden characters")
+    else:
+        print("MATCH: Record exists in both and hash is same (No Change)")
+elif df_inc.count() == 0 and df_raw.count() > 0:
+    print("DELETE: Record was removed from INC")
+else:
+    print("No data found in both INC and RAW")
