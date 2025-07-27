@@ -111,9 +111,9 @@ def process_snapshot(table_name, key_column):
         # --- WRITE TEMP + ATOMIC REPLACE ---
         df_final.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(snapshot_temp)
         
-        #spark.sql(f"DROP TABLE IF EXISTS {snapshot_table}")
-        #spark.sql(f"ALTER TABLE {snapshot_temp} RENAME TO {snapshot_table}")
-        #print(f"✅ Snapshot table updated for: {snapshot_table}")
+        spark.sql(f"DROP TABLE IF EXISTS {snapshot_table}")
+        spark.sql(f"ALTER TABLE {snapshot_temp} RENAME TO {snapshot_table}")
+        print(f"✅ Snapshot table updated for: {snapshot_table}")
 
         end_time = datetime.now()
         
