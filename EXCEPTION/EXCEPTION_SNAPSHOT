@@ -148,3 +148,30 @@ if active_tables:
 else:
     print("[INFO] No active tables to process.")
 
+
+
+#New Code 
+
+# --- MERGE FINAL LOG ---
+try:
+    main_log_df = spark.read.table("snapshot_final_incremental_logs")
+    daily_log_df = spark.read.table("snapshot_daily_incremental_logs")
+except:
+    print("[WARNING] Log table read failed. Initializing empty.")
+    daily_log_df = spark.createDataFrame([], main_log_df.schema)
+
+join_keys = ["table_name", "load_date", "UTCTimestamp", "status"]
+cleaned_main_log_df = main_log_df.alias("main").join(
+    daily_log_df.select(*join_keys).alias("daily"), on=join_keys, how="left_anti"
+)
+
+final_main_log_df = cleaned_main_log_df.unionByName(daily_log_df)
+
+display(final_main_log_df)
+
+final_main_log_df.write.mode("overwrite").saveAsTable("snapshot_final_incremental_logs")
+
+spark.sql("DROP TABLE IF EXISTS snapshot_daily_incremental_logs")
+spark.sql("CREATE TABLE snapshot_daily_incremental_logs AS SELECT * FROM snapshot_final_incremental_logs WHERE 1=0")
+
+print("[INFO] Execution finished.")
