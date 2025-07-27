@@ -1,0 +1,150 @@
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit, substring, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import pytz
+import os
+import uuid
+import traceback
+from pyspark.sql.functions import col, trim, when, lit, md5, concat_ws, regexp_replace
+from pyspark.sql.functions import col, trim, when, lit, md5, concat_ws, regexp_replace, upper
+
+# === INIT SPARK SESSION ===
+spark = SparkSession.builder.appName("Process Incremental Tables").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+
+# --- CONFIG ---
+tz = pytz.timezone("America/Chicago")
+Today_date = datetime.now(tz).date()
+lock_file = "/tmp/update_log.lock"
+
+
+# --- CONFIG ---
+tz = pytz.timezone("America/Chicago")
+Today_date = datetime.now(tz).date()
+lock_file = "/tmp/update_log.lock"
+
+# --- Step 1: Define target table ---
+raw_table_name = "staff_current_demographics_raw"
+target_table_name = raw_table_name.split(".")[-1]  # Extract table name only
+target_table_key = "staff_demographics"
+exclude_cols = {"ROW_HASH", "INSERT_TIMESTAMP", "UTCTimestamp", "STATUS", "row_hash"}
+
+# --- Step 2: Hashing function with invisible char cleanup ---
+def add_updated_row_hash(df):
+    cleaned_cols = [
+        regexp_replace(
+            when(col(f.name).isNull(), lit("")).otherwise(trim(col(f.name).cast("string"))),
+            r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]',  # Control/invisible characters
+            ""
+        ).alias(f.name)
+        for f in df.schema.fields if f.name not in exclude_cols
+    ]
+    temp_df = df.select(*cleaned_cols)
+    sorted_cols = sorted(temp_df.columns)
+    hash_input = concat_ws("||", *[col(c) for c in sorted_cols]).alias("HASH_INPUT")
+    return temp_df.withColumn("HASH_INPUT", hash_input).withColumn("ROW_HASH", md5(col("HASH_INPUT")))
+
+# --- Step 3: Load original raw table and apply logic only if it matches the target ---
+if target_table_name == "staff_current_demographics_raw":
+    # Load the raw table
+    df_raw = spark.read.format("delta").table(raw_table_name)
+    
+    # Add updated ROW_HASH
+    df_raw_updated = add_updated_row_hash(df_raw)
+    
+    # Select original columns + updated ROW_HASH
+    updated_df = df_raw.join(
+        df_raw_updated.select(target_table_key, "ROW_HASH"),
+        on=target_table_key,
+        how="left"
+    ).drop(df_raw["ROW_HASH"]).withColumnRenamed("ROW_HASH", "ROW_HASH")
+    
+    # Overwrite back to the same raw table (in-place update)
+    updated_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(raw_table_name)
+    
+    print(f"ROW_HASH updated successfully for table: {raw_table_name}")
+else:
+    print(f"No update needed for table: {raw_table_name}")
+
+
+
+---
+
+
+from pyspark.sql.functions import col, concat_ws, when, lit, trim, md5, regexp_replace
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit, substring, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import pytz
+import os
+import uuid
+import traceback
+from pyspark.sql.functions import col, concat_ws, when, lit, trim, regexp_replace, md5
+
+
+# === INIT SPARK SESSION ===
+spark = SparkSession.builder.appName("Process Incremental Tables").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+
+# --- CONFIG ---
+tz = pytz.timezone("America/Chicago")
+Today_date = datetime.now(tz).date()
+lock_file = "/tmp/update_log.lock"
+
+
+# --- Step 1: Define target table ---
+raw_table_name = "patient_current_demographics_RAW"
+target_table_name = raw_table_name.split(".")[-1]  # Extract table name only
+target_table_key = "patient_current_demographics"
+exclude_cols = {"ROW_HASH", "INSERT_TIMESTAMP", "UTCTimestamp", "STATUS", "row_hash"}
+
+# --- Step 2: Hashing function with invisible char cleanup ---
+def add_updated_row_hash(df):
+    cleaned_cols = [
+        regexp_replace(
+            when(col(f.name).isNull(), lit("")).otherwise(trim(col(f.name).cast("string"))),
+            r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]',  # Control/invisible characters
+            ""
+        ).alias(f.name)
+        for f in df.schema.fields if f.name not in exclude_cols
+    ]
+    temp_df = df.select(*cleaned_cols)
+    sorted_cols = sorted(temp_df.columns)
+    hash_input = concat_ws("||", *[col(c) for c in sorted_cols]).alias("HASH_INPUT")
+    return temp_df.withColumn("HASH_INPUT", hash_input).withColumn("ROW_HASH", md5(col("HASH_INPUT")))
+
+# --- Step 3: Load original raw table and apply logic only if it matches the target ---
+if target_table_name == "patient_current_demographics_RAW":
+    # Load the raw table
+    df_raw = spark.read.format("delta").table(raw_table_name)
+    
+    # Add updated ROW_HASH
+    df_raw_updated = add_updated_row_hash(df_raw)
+    
+    # Select original columns + updated ROW_HASH
+    updated_df = df_raw.join(
+        df_raw_updated.select(target_table_key, "ROW_HASH"),
+        on=target_table_key,
+        how="left"
+    ).drop(df_raw["ROW_HASH"]).withColumnRenamed("ROW_HASH", "ROW_HASH")
+    
+    # Overwrite back to the same raw table (in-place update)
+    updated_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(raw_table_name)
+    
+    print(f"ROW_HASH updated successfully for table: {raw_table_name}")
+else:
+    print(f"No update needed for table: {raw_table_name}")

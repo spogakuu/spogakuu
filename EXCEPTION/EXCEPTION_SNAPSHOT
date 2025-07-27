@@ -1,0 +1,150 @@
+# --- IMPORTS ---loading as  a table format
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sha2, concat_ws, when, lit, substring, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+import pytz
+import os
+import uuid
+import traceback
+
+# === INIT SPARK SESSION ===
+spark = SparkSession.builder.appName("Process History Tables").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
+spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+
+# === CONFIG ===
+tz = pytz.timezone("America/Chicago")
+Today_date = datetime.now(tz).date()
+lock_file = "/tmp/update_log.lock"
+
+# === LOG FUNCTION ===
+def release_lock():
+    if os.path.exists(lock_file):
+        os.remove(lock_file)
+
+def update_log(table_name, status, utc_timestamp_str, start_time, end_time, count="0", error_message=""):
+    run_date = datetime.now(tz).date()
+    new_row = [(str(table_name), str(status), run_date, str(utc_timestamp_str), str(start_time.isoformat()), str(end_time.isoformat()), str(count), str(error_message), str('EXCEPTION'))]
+    schema = spark.read.table("snapshot_daily_incremental_logs").schema
+    new_df = spark.createDataFrame(new_row, schema)
+
+    def acquire_lock(timeout=30):
+        import time
+        start = time.time()
+        while os.path.exists(lock_file):
+            if time.time() - start > timeout:
+                return False
+            time.sleep(0.5)
+        with open(lock_file, 'w') as f:
+            f.write("locked")
+        return True
+
+    if not acquire_lock():
+        print(f"[LOCK] Could not acquire lock for {table_name}")
+        return
+
+    try:
+        existing_df = spark.read.table("snapshot_daily_incremental_logs")
+        filtered_df = existing_df.filter(~(
+            (col("table_name") == table_name) &
+            (col("load_date") == run_date) &
+            (col("UTCTimestamp") == utc_timestamp_str) &
+            (col("status") == status)
+        ))
+        final_df = filtered_df.unionByName(new_df)
+        final_df.write.mode("overwrite").saveAsTable("snapshot_daily_incremental_logs")
+    except:
+        new_df.write.mode("overwrite").saveAsTable("snapshot_daily_incremental_logs")
+    finally:
+        release_lock()
+
+# === MAIN PROCESSING FUNCTION ===
+def process_snapshot(table_name, key_column):
+    try:
+        start_time = datetime.now()
+        raw_table = table_name + "_RAW"
+        snapshot_table = table_name + "_INC"
+        snapshot_temp = snapshot_table + "_TEMP"
+        utc_str = datetime.now(tz).strftime("%Y-%m-%d 00:00:00")
+
+        print(f"\n🔄 Processing table: {table_name}")
+
+        df_raw = spark.read.table(raw_table)
+        df_snap = spark.read.table(snapshot_table)
+
+        # Add UTCTimestamp to raw
+        df_raw = df_raw.withColumn("UTCTimestamp", lit(utc_str))
+
+        # --- DELETES ---
+        df_deletes = df_snap.select(key_column).distinct() \
+            .join(df_raw.select(key_column).distinct(), on=key_column, how="left_anti")
+
+        delete_count = df_deletes.count()
+        
+        print(f"❌ Deletes (key not in raw): {delete_count}")
+
+        df_keep = df_snap.join(df_deletes.select(key_column), on=key_column, how="left_anti")
+
+        # --- INSERTS ---
+        df_inserts = df_raw.join(df_snap.select("row_hash").distinct(), on="row_hash", how="left_anti")
+        insert_count = df_inserts.count()
+        print(f"🟢 Inserts (new row_hash): {insert_count}")
+
+        # --- UPDATES ---
+        df_updates = df_raw.join(
+            df_snap.select(key_column, "row_hash").withColumnRenamed("row_hash", "row_hash_right"),
+            on=key_column, how="inner"
+        ).filter(col("row_hash") != col("row_hash_right")) \
+         .drop("row_hash_right")
+        update_count = df_updates.count()
+        print(f"🟡 Updates (same key, changed hash): {update_count}")
+
+        # --- FINAL MERGE ---
+        df_changes = df_inserts.unionByName(df_updates, allowMissingColumns=True)
+        df_final = df_keep.unionByName(df_changes, allowMissingColumns=True)
+
+        # --- WRITE TEMP + ATOMIC REPLACE ---
+        df_final.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(snapshot_temp)
+        
+        #spark.sql(f"DROP TABLE IF EXISTS {snapshot_table}")
+        #spark.sql(f"ALTER TABLE {snapshot_temp} RENAME TO {snapshot_table}")
+        #print(f"✅ Snapshot table updated for: {snapshot_table}")
+
+        end_time = datetime.now()
+        
+        if insert_count > 0:
+            update_log(table_name, "I", utc_str, start_time, end_time, str(insert_count))
+        if update_count > 0:
+            update_log(table_name, "U", utc_str, start_time, end_time, str(update_count))
+
+    except Exception as e:
+        print(f"[ERROR] Failed processing table: {table_name}")
+        print(traceback.format_exc())
+        update_log(table_name, "FAILURE", utc_str, start_time, datetime.now(), "0", traceback.format_exc())
+
+# === LOAD TABLE LIST AND EXECUTE ===
+try:
+    print("[INFO] Reading active table list...")
+    table_list_df = spark.read.table("TABLES_LIST")
+    active_tables = [(row["TABLE_NAME"], row["KEY_COLUMN"]) for row in table_list_df.filter("STATUS = 'A'").collect()]
+except Exception as e:
+    print("[FATAL] Failed to read TABLES_LIST.")
+    traceback.print_exc()
+    raise RuntimeError("Cannot proceed without active table list.")
+
+print(f"[INFO] Tables to process: {[t[0] for t in active_tables]}")
+
+# === RUN PARALLEL ===
+if active_tables:
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(process_snapshot, table, key): table for table, key in active_tables}
+        for future in as_completed(futures):
+            print(f"[THREAD COMPLETE] {futures[future]}")
+else:
+    print("[INFO] No active tables to process.")
+
