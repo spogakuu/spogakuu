@@ -6,6 +6,7 @@ from functools import reduce
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz, os, errno, time
+import traceback
 
 # =========================
 # INIT
@@ -22,31 +23,40 @@ tz = pytz.timezone("America/Chicago")
 Today_date = datetime.now(tz).date()
 TODAY_STR = Today_date.strftime("%Y-%m-%d")
 
-LOCK_PATH = "/tmp/staging_logs.lock"  # simple file-based lock
+LOCK_PATH = "/tmp/staging_logs.lock"
+DAILY_LOG = "staging.staging_daily_logs"     # temp working log for the current run/day
+FINAL_LOG = "staging.staging_final_logs"     # end-of-run published snapshot
+CLEAR_DAILY_AT_START = True                  # wipe today's daily rows at run start
 
-DAILY_LOG = "staging.staging_daily_logs"   # one row per (run_date, table_name)
-FINAL_LOG = "staging.staging_final_logs"   # consolidated rollup
+def _ts():
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S.%f %Z")
 
 # =========================
-# UTIL / LOCK
+# UTILS / LOCKING
 # =========================
 def acquire_lock(path=LOCK_PATH, retries=60, delay=1.0):
-    for _ in range(retries):
+    print(f"[{_ts()}] acquire_lock(): trying {path}")
+    for attempt in range(1, retries + 1):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.close(fd)
+            print(f"[{_ts()}] acquire_lock(): acquired on attempt {attempt}")
             return True
         except OSError as e:
             if e.errno != errno.EEXIST:
+                print(f"[{_ts()}] acquire_lock(): unexpected error -> {e}")
                 raise
+            if attempt % 10 == 0:
+                print(f"[{_ts()}] acquire_lock(): still waiting ({attempt}/{retries})")
             time.sleep(delay)
-    raise TimeoutError("Could not acquire log lock")
+    raise TimeoutError(f"[{_ts()}] acquire_lock(): could not acquire after {retries} attempts")
 
 def release_lock(path=LOCK_PATH):
     try:
         os.remove(path)
+        print(f"[{_ts()}] release_lock(): released {path}")
     except FileNotFoundError:
-        pass
+        print(f"[{_ts()}] release_lock(): {path} already released")
 
 def _and_all(conds):
     return reduce(lambda a,b: a & b, conds) if conds else F.lit(True)
@@ -55,17 +65,24 @@ def _select_with_alias(src_alias, cols):
     return [F.col(f"{src_alias}.{c}").alias(c) for c in cols]
 
 def table_exists(tbl):
+    print(f"[{_ts()}] table_exists(): {tbl}")
     try:
         spark.read.table(tbl).limit(1).count()
+        print(f"[{_ts()}] table_exists(): {tbl} exists")
         return True
     except Exception:
+        print(f"[{_ts()}] table_exists(): {tbl} does NOT exist")
         return False
 
 def load_table_metadata():
-    return spark.read.table("TABLES_LIST")
+    print(f"[{_ts()}] load_table_metadata(): reading TABLES_LIST")
+    df = spark.read.table("TABLES_LIST")
+    c = df.count()
+    print(f"[{_ts()}] load_table_metadata(): {c} table(s)")
+    return df
 
 # =========================
-# LOG TABLE SCHEMA
+# LOG TABLE SCHEMA & CREATION (DataFrame-based)
 # =========================
 log_schema = StructType([
     StructField("run_date", DateType(), True),
@@ -74,36 +91,44 @@ log_schema = StructType([
     StructField("inserts", LongType(), True),
     StructField("updates", LongType(), True),
     StructField("deletes", LongType(), True),
-    StructField("attempt", LongType(), True),
     StructField("error_message", StringType(), True),
     StructField("start_ts", TimestampType(), True),
     StructField("end_ts", TimestampType(), True),
-    StructField("duration_seconds", LongType(), True)    # end_ts - start_ts in seconds
+    StructField("duration_seconds", LongType(), True)
 ])
 
-# =========================
-# CREATE LOG TABLES (NO spark.sql)
-# - DAILY_LOG via method #1 (schema-only empty DataFrame)
-# - FINAL_LOG via method #2 (emptyRDD + schema)
-# =========================
 def ensure_log_tables():
+    print(f"[{_ts()}] ensure_log_tables(): ensuring DAILY_LOG and FINAL_LOG")
     if not spark.catalog.tableExists(DAILY_LOG):
-        empty_df_daily = spark.createDataFrame([], log_schema)  # method #1
-        empty_df_daily.write.format("delta").mode("overwrite").saveAsTable(DAILY_LOG)
-
+        print(f"[{_ts()}] ensure_log_tables(): creating {DAILY_LOG} (empty schema DataFrame)")
+        spark.createDataFrame([], log_schema).write.format("delta").mode("overwrite").saveAsTable(DAILY_LOG)
     if not spark.catalog.tableExists(FINAL_LOG):
-        rdd = spark.sparkContext.emptyRDD()                      # method #2
-        empty_df_final = spark.createDataFrame(rdd, log_schema)
-        empty_df_final.write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG)
+        print(f"[{_ts()}] ensure_log_tables(): creating {FINAL_LOG} (emptyRDD + schema)")
+        rdd = spark.sparkContext.emptyRDD()
+        spark.createDataFrame(rdd, log_schema).write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG)
 
 def _get_delta(tbl_name) -> DeltaTable:
-    # Assumes table exists; caller should ensure.
+    print(f"[{_ts()}] _get_delta(): {tbl_name}")
     return DeltaTable.forName(spark, tbl_name)
 
 # =========================
-# DAILY LOG UPSERTS (DeltaTable APIs)
+# DAILY LOGGING (per run / per day)
 # =========================
+def reset_daily_for_today():
+    if not table_exists(DAILY_LOG):
+        return
+    print(f"[{_ts()}] reset_daily_for_today(): CLEAR_DAILY_AT_START={CLEAR_DAILY_AT_START}")
+    if CLEAR_DAILY_AT_START:
+        acquire_lock()
+        try:
+            dt = _get_delta(DAILY_LOG)
+            dt.delete(condition=(F.col("run_date") == F.lit(Today_date)))
+            print(f"[{_ts()}] reset_daily_for_today(): deleted existing rows for {TODAY_STR} in DAILY_LOG")
+        finally:
+            release_lock()
+
 def begin_daily_log(table_name):
+    print(f"[{_ts()}] begin_daily_log(): {table_name}")
     ensure_log_tables()
     acquire_lock()
     try:
@@ -112,17 +137,12 @@ def begin_daily_log(table_name):
             [(Today_date, table_name, now_ts)],
             schema="run_date date, table_name string, now_ts timestamp"
         )
-
         dt = _get_delta(DAILY_LOG)
         (
             dt.alias("t")
-            .merge(
-                src.alias("s"),
-                "t.run_date = s.run_date AND t.table_name = s.table_name"
-            )
+            .merge(src.alias("s"), "t.run_date = s.run_date AND t.table_name = s.table_name")
             .whenMatchedUpdate(set={
                 "status": F.lit("Running"),
-                "attempt": F.coalesce(F.col("t.attempt"), F.lit(0)) + F.lit(1),
                 "error_message": F.lit(None).cast("string"),
                 "start_ts": F.coalesce(F.col("t.start_ts"), F.col("s.now_ts")),
                 "end_ts": F.lit(None).cast("timestamp"),
@@ -135,7 +155,6 @@ def begin_daily_log(table_name):
                 "inserts": F.lit(None).cast("long"),
                 "updates": F.lit(None).cast("long"),
                 "deletes": F.lit(None).cast("long"),
-                "attempt": F.lit(1),
                 "error_message": F.lit(None).cast("string"),
                 "start_ts": F.col("s.now_ts"),
                 "end_ts": F.lit(None).cast("timestamp"),
@@ -143,15 +162,16 @@ def begin_daily_log(table_name):
             })
             .execute()
         )
+        print(f"[{_ts()}] begin_daily_log(): {table_name} set to Running")
     finally:
         release_lock()
 
 def complete_daily_log(table_name, status, inserts=0, updates=0, deletes=0, error_message=None):
+    print(f"[{_ts()}] complete_daily_log(): {table_name} -> {status} (I={inserts}, U={updates}, D={deletes})")
     ensure_log_tables()
     acquire_lock()
     try:
         dt = _get_delta(DAILY_LOG)
-        # compute end_ts and duration from start_ts
         dt.update(
             condition=(F.col("run_date") == F.lit(Today_date)) & (F.col("table_name") == F.lit(table_name)),
             set={
@@ -166,38 +186,49 @@ def complete_daily_log(table_name, status, inserts=0, updates=0, deletes=0, erro
                 ),
             }
         )
+        print(f"[{_ts()}] complete_daily_log(): updated daily row for {table_name}")
     finally:
         release_lock()
 
 def get_today_status(table_name):
+    print(f"[{_ts()}] get_today_status(): {table_name}")
     if not table_exists(DAILY_LOG):
+        print(f"[{_ts()}] get_today_status(): DAILY_LOG not found")
         return None
     df = (
         spark.read.table(DAILY_LOG)
         .where((F.col("run_date") == F.lit(Today_date)) & (F.col("table_name") == F.lit(table_name)))
-        .select("status")
-        .limit(1)
+        .select("status").limit(1)
     )
     rows = df.collect()
-    return rows[0]["status"] if rows else None
+    status = rows[0]["status"] if rows else None
+    print(f"[{_ts()}] get_today_status(): {table_name} -> {status}")
+    return status
 
 # =========================
 # CHANGE DETECTION
 # =========================
 def safe_load_prev_raw_table(table_name):
+    path = f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV"
+    print(f"[{_ts()}] safe_load_prev_raw_table(): {path}")
     try:
-        df = spark.read.table(f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV")
+        df = spark.read.table(path)
         if df.limit(1).count() == 0:
+            print(f"[{_ts()}] safe_load_prev_raw_table(): EMPTY")
             return None
+        print(f"[{_ts()}] safe_load_prev_raw_table(): loaded")
         return df.alias("prev")
-    except Exception:
+    except Exception as e:
+        print(f"[{_ts()}] safe_load_prev_raw_table(): not available -> {e}")
         return None
 
 def build_join_condition(df1_alias, df2_alias, key_columns):
     keys = [k.strip() for k in key_columns]
+    print(f"[{_ts()}] build_join_condition(): keys={keys}")
     return _and_all([F.col(f"{df1_alias}.{k}") == F.col(f"{df2_alias}.{k}") for k in keys])
 
 def detect_inserts_updates(raw_df, raw_prev_df, key_columns, row_hash_col, table_name):
+    print(f"[{_ts()}] detect_inserts_updates(): {table_name}")
     on_cond = build_join_condition("raw", "prev", key_columns)
     joined = raw_df.alias("raw").join(raw_prev_df.alias("prev"), on=on_cond, how="left")
     comparison = (
@@ -207,14 +238,19 @@ def detect_inserts_updates(raw_df, raw_prev_df, key_columns, row_hash_col, table
              .when(F.col(f"raw.{row_hash_col}") != F.col(f"prev.{row_hash_col}"), F.lit("U"))
         ).filter(F.col("status").isNotNull())
     )
+    counts = {r["status"]: r["count"] for r in comparison.groupBy("status").count().collect()}
+    print(f"[{_ts()}] detect_inserts_updates(): I={counts.get('I',0)}, U={counts.get('U',0)}")
     raw_cols = raw_df.columns
     return (comparison.select(*_select_with_alias("raw", raw_cols), F.col("status"))
                       .withColumn("insert_ts", F.current_timestamp())
                       .withColumn("source_table", F.lit(table_name)))
 
 def detect_deletes(raw_df, raw_prev_df, key_columns, table_name):
+    print(f"[{_ts()}] detect_deletes(): {table_name}")
     on_cond = build_join_condition("prev", "raw", key_columns)
     deleted_prev = raw_prev_df.alias("prev").join(raw_df.alias("raw"), on=on_cond, how="left_anti")
+    d_cnt = deleted_prev.limit(1).count()
+    print(f"[{_ts()}] detect_deletes(): D>0? {'YES' if d_cnt > 0 else 'NO'}")
     raw_cols = raw_df.columns
     return (deleted_prev.select(*_select_with_alias("prev", raw_cols))
                         .withColumn("status", F.lit("D"))
@@ -223,54 +259,68 @@ def detect_deletes(raw_df, raw_prev_df, key_columns, table_name):
 
 # =========================
 # WRITES / SWAPS / SNAPSHOTS
-# (CTAS kept for simplicity; can be converted to DataFrame writes if you prefer)
 # =========================
 def write_to_temp_staging(df, table_name):
     temp_staging_table = f"staging.temp_stg_{table_name}"
-    by = df.groupBy("status").count().collect() if df.limit(1).count() > 0 else []
+    print(f"[{_ts()}] write_to_temp_staging(): {temp_staging_table}")
+    has_rows = df.limit(1).count() > 0
+    by = df.groupBy("status").count().collect() if has_rows else []
     df.write.mode("overwrite").format("delta").saveAsTable(temp_staging_table)
     counts = {"I":0, "U":0, "D":0}
     for r in by:
         counts[r["status"]] = int(r["count"])
+    print(f"[{_ts()}] write_to_temp_staging(): counts {counts}")
     return counts
 
 def finalize_staging_table(table_name):
     temp_staging_table = f"staging.temp_stg_{table_name}"
     final_staging_table = f"staging.stg_{table_name}"
+    print(f"[{_ts()}] finalize_staging_table(): promoting {temp_staging_table} -> {final_staging_table}")
     if table_exists(temp_staging_table) and spark.read.table(temp_staging_table).limit(1).count() > 0:
         spark.sql(f"CREATE OR REPLACE TABLE {final_staging_table} AS SELECT * FROM {temp_staging_table}")
+        print(f"[{_ts()}] finalize_staging_table(): created/replaced {final_staging_table}")
     spark.sql(f"DROP TABLE IF EXISTS {temp_staging_table}")
+    print(f"[{_ts()}] finalize_staging_table(): dropped {temp_staging_table}")
 
 def move_raw_to_prev_raw(table_name):
     raw_table = f"MHMR_LAKEHOUSE.RAW.{table_name}_RAW"
     prev_raw_table = f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV"
+    print(f"[{_ts()}] move_raw_to_prev_raw(): {raw_table} -> {prev_raw_table}")
     spark.sql(f"CREATE OR REPLACE TABLE {prev_raw_table} AS SELECT * FROM {raw_table}")
+    print(f"[{_ts()}] move_raw_to_prev_raw(): done")
 
 def snapshot_prev_raw_table(table_name):
     snapshot_table = f"MHMR_LAKEHOUSE.PREV_RAW_SNAPSHOT.{table_name}_RAW_PREV_{Today_date.strftime('%Y%m%d')}"
     prev_raw_table = f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV"
+    print(f"[{_ts()}] snapshot_prev_raw_table(): {prev_raw_table} -> {snapshot_table}")
     spark.sql(f"CREATE OR REPLACE TABLE {snapshot_table} AS SELECT * FROM {prev_raw_table}")
+    print(f"[{_ts()}] snapshot_prev_raw_table(): done")
 
 # =========================
-# PER-TABLE EXECUTION WITH RETRY/IDEMPOTENCY
+# PER-TABLE EXECUTION
 # =========================
 def process_single_table(row):
     table_name = row["TABLE_NAME"]
     key_columns = [k.strip() for k in row["KEY_COLUMN"].split(",")]
     row_hash_col = "row_hash"
 
-    # Skip if already succeeded today
-    status = get_today_status(table_name)
-    if status == "Succeeded":
-        return (table_name, "Skipped", {"I":0,"U":0,"D":0}, None)
-
-    begin_daily_log(table_name)
-
+    print(f"[{_ts()}] process_single_table(): BEGIN {table_name}, keys={key_columns}")
     try:
-        raw_df = spark.read.table(f"MHMR_LAKEHOUSE.RAW.{table_name}_RAW").alias("raw")
+        status = get_today_status(table_name)
+        if status == "Succeeded":
+            print(f"[{_ts()}] process_single_table(): {table_name} already Succeeded today -> Skipped")
+            return (table_name, "Skipped", {"I":0,"U":0,"D":0}, None)
+
+        begin_daily_log(table_name)
+
+        raw_path = f"MHMR_LAKEHOUSE.RAW.{table_name}_RAW"
+        print(f"[{_ts()}] process_single_table(): reading RAW {raw_path}")
+        raw_df = spark.read.table(raw_path).alias("raw")
+
         raw_prev_df = safe_load_prev_raw_table(table_name)
 
         if raw_prev_df is None:
+            print(f"[{_ts()}] process_single_table(): no PREV -> all Inserts")
             changes_df = (raw_df
                           .select(*_select_with_alias("raw", raw_df.columns))
                           .withColumn("status", F.lit("I"))
@@ -280,6 +330,7 @@ def process_single_table(row):
             changes_df = detect_inserts_updates(raw_df, raw_prev_df, key_columns, row_hash_col, table_name)
             deletes_df = detect_deletes(raw_df, raw_prev_df, key_columns, table_name)
             if deletes_df.limit(1).count() > 0:
+                print(f"[{_ts()}] process_single_table(): unioning deletes")
                 changes_df = changes_df.unionByName(deletes_df)
 
         counts = write_to_temp_staging(changes_df, table_name)
@@ -287,75 +338,93 @@ def process_single_table(row):
         move_raw_to_prev_raw(table_name)
         snapshot_prev_raw_table(table_name)
 
-        complete_daily_log(
-            table_name,
-            "Succeeded",
-            inserts=counts.get("I",0),
-            updates=counts.get("U",0),
-            deletes=counts.get("D",0)
-        )
+        complete_daily_log(table_name, "Succeeded",
+                           inserts=counts.get("I",0),
+                           updates=counts.get("U",0),
+                           deletes=counts.get("D",0))
+        print(f"[{_ts()}] process_single_table(): END {table_name} -> Succeeded")
         return (table_name, "Succeeded", counts, None)
 
     except Exception as e:
+        print(f"[{_ts()}] process_single_table(): ERROR {table_name} -> {e}")
+        traceback.print_exc()
         complete_daily_log(table_name, "Failed", 0, 0, 0, error_message=str(e))
         return (table_name, "Failed", {"I":0,"U":0,"D":0}, str(e))
 
 # =========================
-# FINAL CONSOLIDATION (DeltaTable APIs)
+# END-OF-RUN CONSOLIDATION (push DAILY -> FINAL once)
 # =========================
 def consolidate_daily_into_final():
+    print(f"[{_ts()}] consolidate_daily_into_final(): START")
     ensure_log_tables()
     acquire_lock()
     try:
-        # Delete today's slice from FINAL
         dt_final = _get_delta(FINAL_LOG)
         dt_final.delete(condition=(F.col("run_date") == F.lit(Today_date)))
+        print(f"[{_ts()}] consolidate_daily_into_final(): cleared FINAL for {TODAY_STR}")
 
-        # Insert today's rows from DAILY
         todays = spark.read.table(DAILY_LOG).where(F.col("run_date") == F.lit(Today_date))
+        cnt = todays.count()
         todays.write.format("delta").mode("append").saveAsTable(FINAL_LOG)
+        print(f"[{_ts()}] consolidate_daily_into_final(): appended {cnt} row(s) to FINAL for {TODAY_STR}")
 
-        spark.catalog.clearCache()  # keep Fabric reads fresh
+        spark.catalog.clearCache()
     finally:
         release_lock()
+    print(f"[{_ts()}] consolidate_daily_into_final(): END")
 
 # =========================
-# RUNNER (PARALLEL)
+# PARALLEL RUNNER
 # =========================
 def _resolve_max_workers(n_tables, fallback=8):
-    # Prefer spark.conf "mhmr.maxWorkers" or env MAX_WORKERS; cap by table count
+    print(f"[{_ts()}] _resolve_max_workers(): n_tables={n_tables}")
     try:
         conf_val = int(spark.conf.get("mhmr.maxWorkers"))
         if conf_val > 0:
-            return min(conf_val, max(1, n_tables))
+            mw = min(conf_val, max(1, n_tables))
+            print(f"[{_ts()}] _resolve_max_workers(): using spark.conf mhmr.maxWorkers={mw}")
+            return mw
     except Exception:
         pass
     try:
         env_val = int(os.environ.get("MAX_WORKERS", "0"))
         if env_val > 0:
-            return min(env_val, max(1, n_tables))
+            mw = min(env_val, max(1, n_tables))
+            print(f"[{_ts()}] _resolve_max_workers(): using env MAX_WORKERS={mw}")
+            return mw
     except Exception:
         pass
-    return min(fallback, max(1, n_tables))
+    mw = min(fallback, max(1, n_tables))
+    print(f"[{_ts()}] _resolve_max_workers(): default {mw}")
+    return mw
 
 def process_all_tables_parallel(max_workers=None):
+    print(f"[{_ts()}] process_all_tables_parallel(): START")
     ensure_log_tables()
+    reset_daily_for_today()   # make daily per-run if CLEAR_DAILY_AT_START=True
+
     tables_df = load_table_metadata()
     rows = tables_df.collect()
     if max_workers is None:
         max_workers = _resolve_max_workers(len(rows))
 
+    print(f"[{_ts()}] process_all_tables_parallel(): launching pool max_workers={max_workers}")
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(process_single_table, r.asDict()) for r in rows]
         for fut in as_completed(futures):
-            results.append(fut.result())
+            res = fut.result()
+            print(f"[{_ts()}] process_all_tables_parallel(): completed -> {res[0]} : {res[1]}")
+            results.append(res)
 
     consolidate_daily_into_final()
+    print(f"[{_ts()}] process_all_tables_parallel(): END. {len(results)} table(s) processed.")
     return results
 
 # === RUN ===
+print(f"[{_ts()}] MAIN: kicking off parallel processing")
 results = process_all_tables_parallel()
-# Optional interactive summary:
-# for t, status, counts, err in results:
-#     print(f"{t}: {status} (I={counts.get('I',0)}, U={counts.get('U',0)}, D={counts.get('D',0)}){'' if not err else ' | ' + err}")
+print(f"[{_ts()}] MAIN: done. Summary:")
+for t, status, counts, err in results:
+    print(f"[{_ts()}] MAIN: {t}: {status} (I={counts.get('I',0)}, U={counts.get('U',0)}, D={counts.get('D',0)})"
+          f"{'' if not err else ' | ' + err}")
