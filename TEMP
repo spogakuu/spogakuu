@@ -1,5 +1,7 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, DateType, LongType, TimestampType
+from delta.tables import DeltaTable
 from functools import reduce
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,10 +22,10 @@ tz = pytz.timezone("America/Chicago")
 Today_date = datetime.now(tz).date()
 TODAY_STR = Today_date.strftime("%Y-%m-%d")
 
-LOCK_PATH = "/tmp/staging_logs.lock"
+LOCK_PATH = "/tmp/staging_logs.lock"  # simple file-based lock
 
-DAILY_LOG = "staging.staging_daily_logs"
-FINAL_LOG = "staging.staging_final_logs"
+DAILY_LOG = "staging.staging_daily_logs"   # one row per (run_date, table_name)
+FINAL_LOG = "staging.staging_final_logs"   # consolidated rollup
 
 # =========================
 # UTIL / LOCK
@@ -47,7 +49,7 @@ def release_lock(path=LOCK_PATH):
         pass
 
 def _and_all(conds):
-    return reduce(lambda a, b: a & b, conds) if conds else F.lit(True)
+    return reduce(lambda a,b: a & b, conds) if conds else F.lit(True)
 
 def _select_with_alias(src_alias, cols):
     return [F.col(f"{src_alias}.{c}").alias(c) for c in cols]
@@ -63,106 +65,121 @@ def load_table_metadata():
     return spark.read.table("TABLES_LIST")
 
 # =========================
-# LOG TABLES
+# LOG TABLE SCHEMA
 # =========================
-def ensure_log_tables():
-    spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {DAILY_LOG} (
-            run_date DATE,
-            table_name STRING,
-            status STRING,
-            inserts BIGINT,
-            updates BIGINT,
-            deletes BIGINT,
-            attempt INT,
-            error_message STRING,
-            start_ts TIMESTAMP,
-            end_ts TIMESTAMP,
-            duration_seconds BIGINT
-        ) USING DELTA
-        PARTITIONED BY (run_date)
-    """)
-    spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {FINAL_LOG} (
-            run_date DATE,
-            table_name STRING,
-            status STRING,
-            inserts BIGINT,
-            updates BIGINT,
-            deletes BIGINT,
-            attempt INT,
-            error_message STRING,
-            start_ts TIMESTAMP,
-            end_ts TIMESTAMP,
-            duration_seconds BIGINT
-        ) USING DELTA
-        PARTITIONED BY (run_date)
-    """)
+log_schema = StructType([
+    StructField("run_date", DateType(), True),
+    StructField("table_name", StringType(), True),
+    StructField("status", StringType(), True),           # Running | Succeeded | Failed | Skipped
+    StructField("inserts", LongType(), True),
+    StructField("updates", LongType(), True),
+    StructField("deletes", LongType(), True),
+    StructField("attempt", LongType(), True),
+    StructField("error_message", StringType(), True),
+    StructField("start_ts", TimestampType(), True),
+    StructField("end_ts", TimestampType(), True),
+    StructField("duration_seconds", LongType(), True)    # end_ts - start_ts in seconds
+])
 
 # =========================
-# DAILY LOG
+# CREATE LOG TABLES (NO spark.sql)
+# - DAILY_LOG via method #1 (schema-only empty DataFrame)
+# - FINAL_LOG via method #2 (emptyRDD + schema)
+# =========================
+def ensure_log_tables():
+    if not spark.catalog.tableExists(DAILY_LOG):
+        empty_df_daily = spark.createDataFrame([], log_schema)  # method #1
+        empty_df_daily.write.format("delta").mode("overwrite").saveAsTable(DAILY_LOG)
+
+    if not spark.catalog.tableExists(FINAL_LOG):
+        rdd = spark.sparkContext.emptyRDD()                      # method #2
+        empty_df_final = spark.createDataFrame(rdd, log_schema)
+        empty_df_final.write.format("delta").mode("overwrite").saveAsTable(FINAL_LOG)
+
+def _get_delta(tbl_name) -> DeltaTable:
+    # Assumes table exists; caller should ensure.
+    return DeltaTable.forName(spark, tbl_name)
+
+# =========================
+# DAILY LOG UPSERTS (DeltaTable APIs)
 # =========================
 def begin_daily_log(table_name):
+    ensure_log_tables()
     acquire_lock()
     try:
-        spark.sql(f"""
-            MERGE INTO {DAILY_LOG} t
-            USING (
-                SELECT DATE('{TODAY_STR}') AS run_date,
-                       '{table_name}'       AS table_name,
-                       current_timestamp()  AS now_ts
-            ) s
-            ON t.run_date = s.run_date AND t.table_name = s.table_name
-            WHEN MATCHED THEN UPDATE SET
-                t.status        = 'Running',
-                t.attempt       = COALESCE(t.attempt, 0) + 1,
-                t.error_message = NULL,
-                t.start_ts      = COALESCE(t.start_ts, s.now_ts),
-                t.end_ts        = NULL,
-                t.duration_seconds = NULL
-            WHEN NOT MATCHED THEN INSERT (
-                run_date, table_name, status, inserts, updates, deletes,
-                attempt, error_message, start_ts, end_ts, duration_seconds
-            ) VALUES (
-                s.run_date, s.table_name, 'Running', NULL, NULL, NULL,
-                1, NULL, s.now_ts, NULL, NULL
+        now_ts = datetime.now(tz)
+        src = spark.createDataFrame(
+            [(Today_date, table_name, now_ts)],
+            schema="run_date date, table_name string, now_ts timestamp"
+        )
+
+        dt = _get_delta(DAILY_LOG)
+        (
+            dt.alias("t")
+            .merge(
+                src.alias("s"),
+                "t.run_date = s.run_date AND t.table_name = s.table_name"
             )
-        """)
+            .whenMatchedUpdate(set={
+                "status": F.lit("Running"),
+                "attempt": F.coalesce(F.col("t.attempt"), F.lit(0)) + F.lit(1),
+                "error_message": F.lit(None).cast("string"),
+                "start_ts": F.coalesce(F.col("t.start_ts"), F.col("s.now_ts")),
+                "end_ts": F.lit(None).cast("timestamp"),
+                "duration_seconds": F.lit(None).cast("long"),
+            })
+            .whenNotMatchedInsert(values={
+                "run_date": F.col("s.run_date"),
+                "table_name": F.col("s.table_name"),
+                "status": F.lit("Running"),
+                "inserts": F.lit(None).cast("long"),
+                "updates": F.lit(None).cast("long"),
+                "deletes": F.lit(None).cast("long"),
+                "attempt": F.lit(1),
+                "error_message": F.lit(None).cast("string"),
+                "start_ts": F.col("s.now_ts"),
+                "end_ts": F.lit(None).cast("timestamp"),
+                "duration_seconds": F.lit(None).cast("long"),
+            })
+            .execute()
+        )
     finally:
         release_lock()
 
 def complete_daily_log(table_name, status, inserts=0, updates=0, deletes=0, error_message=None):
+    ensure_log_tables()
     acquire_lock()
     try:
-        err_sql = "NULL" if not error_message else f"'{error_message.replace("'","''")}'"
-        spark.sql(f"""
-            UPDATE {DAILY_LOG}
-            SET status = '{status}',
-                inserts = {int(inserts)},
-                updates = {int(updates)},
-                deletes = {int(deletes)},
-                error_message = {err_sql},
-                end_ts = current_timestamp(),
-                duration_seconds =
-                    CASE
-                        WHEN start_ts IS NOT NULL
-                        THEN CAST(unix_timestamp(current_timestamp()) - unix_timestamp(start_ts) AS BIGINT)
-                        ELSE NULL
-                    END
-            WHERE run_date = DATE('{TODAY_STR}') AND table_name = '{table_name}';
-        """)
+        dt = _get_delta(DAILY_LOG)
+        # compute end_ts and duration from start_ts
+        dt.update(
+            condition=(F.col("run_date") == F.lit(Today_date)) & (F.col("table_name") == F.lit(table_name)),
+            set={
+                "status": F.lit(status),
+                "inserts": F.lit(int(inserts)),
+                "updates": F.lit(int(updates)),
+                "deletes": F.lit(int(deletes)),
+                "error_message": F.lit(error_message).cast("string"),
+                "end_ts": F.current_timestamp(),
+                "duration_seconds": (
+                    (F.unix_timestamp(F.current_timestamp()) - F.unix_timestamp(F.col("start_ts"))).cast("long")
+                ),
+            }
+        )
     finally:
         release_lock()
 
 def get_today_status(table_name):
-    try:
-        df = spark.read.table(DAILY_LOG).where(
-            (F.col("run_date") == F.lit(Today_date)) & (F.col("table_name") == F.lit(table_name))
-        ).select("status").limit(1)
-        rows = df.collect()
-        return rows[0]["status"] if rows else None
-    except Exception:
+    if not table_exists(DAILY_LOG):
         return None
+    df = (
+        spark.read.table(DAILY_LOG)
+        .where((F.col("run_date") == F.lit(Today_date)) & (F.col("table_name") == F.lit(table_name)))
+        .select("status")
+        .limit(1)
+    )
+    rows = df.collect()
+    return rows[0]["status"] if rows else None
 
 # =========================
 # CHANGE DETECTION
@@ -206,6 +223,7 @@ def detect_deletes(raw_df, raw_prev_df, key_columns, table_name):
 
 # =========================
 # WRITES / SWAPS / SNAPSHOTS
+# (CTAS kept for simplicity; can be converted to DataFrame writes if you prefer)
 # =========================
 def write_to_temp_staging(df, table_name):
     temp_staging_table = f"staging.temp_stg_{table_name}"
@@ -234,19 +252,24 @@ def snapshot_prev_raw_table(table_name):
     spark.sql(f"CREATE OR REPLACE TABLE {snapshot_table} AS SELECT * FROM {prev_raw_table}")
 
 # =========================
-# PER-TABLE EXECUTION
+# PER-TABLE EXECUTION WITH RETRY/IDEMPOTENCY
 # =========================
 def process_single_table(row):
     table_name = row["TABLE_NAME"]
     key_columns = [k.strip() for k in row["KEY_COLUMN"].split(",")]
     row_hash_col = "row_hash"
+
+    # Skip if already succeeded today
     status = get_today_status(table_name)
     if status == "Succeeded":
         return (table_name, "Skipped", {"I":0,"U":0,"D":0}, None)
+
     begin_daily_log(table_name)
+
     try:
         raw_df = spark.read.table(f"MHMR_LAKEHOUSE.RAW.{table_name}_RAW").alias("raw")
         raw_prev_df = safe_load_prev_raw_table(table_name)
+
         if raw_prev_df is None:
             changes_df = (raw_df
                           .select(*_select_with_alias("raw", raw_df.columns))
@@ -258,49 +281,61 @@ def process_single_table(row):
             deletes_df = detect_deletes(raw_df, raw_prev_df, key_columns, table_name)
             if deletes_df.limit(1).count() > 0:
                 changes_df = changes_df.unionByName(deletes_df)
+
         counts = write_to_temp_staging(changes_df, table_name)
         finalize_staging_table(table_name)
         move_raw_to_prev_raw(table_name)
         snapshot_prev_raw_table(table_name)
-        complete_daily_log(table_name, "Succeeded", inserts=counts.get("I",0), updates=counts.get("U",0), deletes=counts.get("D",0))
+
+        complete_daily_log(
+            table_name,
+            "Succeeded",
+            inserts=counts.get("I",0),
+            updates=counts.get("U",0),
+            deletes=counts.get("D",0)
+        )
         return (table_name, "Succeeded", counts, None)
+
     except Exception as e:
         complete_daily_log(table_name, "Failed", 0, 0, 0, error_message=str(e))
         return (table_name, "Failed", {"I":0,"U":0,"D":0}, str(e))
 
 # =========================
-# FINAL CONSOLIDATION
+# FINAL CONSOLIDATION (DeltaTable APIs)
 # =========================
 def consolidate_daily_into_final():
+    ensure_log_tables()
     acquire_lock()
     try:
-        spark.sql(f"DELETE FROM {FINAL_LOG} WHERE run_date = DATE('{TODAY_STR}')")
-        spark.sql(f"INSERT INTO {FINAL_LOG} SELECT * FROM {DAILY_LOG} WHERE run_date = DATE('{TODAY_STR}')")
-        spark.catalog.clearCache()
+        # Delete today's slice from FINAL
+        dt_final = _get_delta(FINAL_LOG)
+        dt_final.delete(condition=(F.col("run_date") == F.lit(Today_date)))
+
+        # Insert today's rows from DAILY
+        todays = spark.read.table(DAILY_LOG).where(F.col("run_date") == F.lit(Today_date))
+        todays.write.format("delta").mode("append").saveAsTable(FINAL_LOG)
+
+        spark.catalog.clearCache()  # keep Fabric reads fresh
     finally:
         release_lock()
 
 # =========================
 # RUNNER (PARALLEL)
 # =========================
-
 def _resolve_max_workers(n_tables, fallback=8):
-    """Derive a sensible max_workers from Spark conf / env, capped by table count."""
-    # Preferred config path: spark.conf "mhmr.maxWorkers" (settable in Fabric Notebook settings)
+    # Prefer spark.conf "mhmr.maxWorkers" or env MAX_WORKERS; cap by table count
     try:
         conf_val = int(spark.conf.get("mhmr.maxWorkers"))
         if conf_val > 0:
             return min(conf_val, max(1, n_tables))
     except Exception:
         pass
-    # Fallback to environment variable
     try:
         env_val = int(os.environ.get("MAX_WORKERS", "0"))
         if env_val > 0:
             return min(env_val, max(1, n_tables))
     except Exception:
         pass
-    # Sensible default: up to 8 threads, but never more than table count
     return min(fallback, max(1, n_tables))
 
 def process_all_tables_parallel(max_workers=None):
@@ -321,3 +356,6 @@ def process_all_tables_parallel(max_workers=None):
 
 # === RUN ===
 results = process_all_tables_parallel()
+# Optional interactive summary:
+# for t, status, counts, err in results:
+#     print(f"{t}: {status} (I={counts.get('I',0)}, U={counts.get('U',0)}, D={counts.get('D',0)}){'' if not err else ' | ' + err}")
