@@ -1,4 +1,3 @@
-# FINAL FABRIC SCRIPT: Process History Tables with Logs, Hash Compare, Retry, ThreadPool, and Prints
 
 from pyspark.sql import SparkSession, functions as F, types as T
 from datetime import datetime
@@ -24,142 +23,131 @@ def _ts():
 # === LOG TABLE CREATION ===
 def ensure_log_tables_exist():
     print(f"[{_ts()}] Checking log tables existence...")
+    schema = T.StructType([
+        T.StructField("run_date", T.DateType()),
+        T.StructField("table_name", T.StringType()),
+        T.StructField("status", T.StringType()),
+        T.StructField("error_message", T.StringType()),
+        T.StructField("insert_timestamp", T.TimestampType()),
+        T.StructField("start_time", T.TimestampType()),
+        T.StructField("end_time", T.TimestampType()),
+        T.StructField("duration_sec", T.DoubleType())
+    ])
     try:
         spark.read.table("logs.daily_log")
         print(f"[{_ts()}] logs.daily_log exists.")
     except:
-        print(f"[{_ts()}] logs.daily_log not found. Creating empty table...")
-        schema = T.StructType([
-            T.StructField("run_date", T.DateType()),
-            T.StructField("table_name", T.StringType()),
-            T.StructField("status", T.StringType()),
-            T.StructField("error_message", T.StringType()),
-            T.StructField("insert_timestamp", T.TimestampType()),
-            T.StructField("start_time", T.TimestampType()),
-            T.StructField("end_time", T.TimestampType()),
-            T.StructField("duration_sec", T.DoubleType())
-        ])
-        empty_df = spark.createDataFrame([], schema)
-        empty_df.write.mode("overwrite").saveAsTable("logs.daily_log")
-        print(f"[{_ts()}] logs.daily_log created.")
+        print(f"[{_ts()}] logs.daily_log not found. Creating...")
+        spark.createDataFrame([], schema).write.mode("overwrite").saveAsTable("logs.daily_log")
 
-# === LOGGING FUNCTIONS ===
+    try:
+        spark.read.table("logs.final_log")
+        print(f"[{_ts()}] logs.final_log exists.")
+    except:
+        print(f"[{_ts()}] logs.final_log not found. Creating...")
+        spark.createDataFrame([], schema).write.mode("overwrite").saveAsTable("logs.final_log")
+
+# === LOGGING ===
 def begin_daily_log(table_name):
     print("\n" + "="*60)
-    print(f"[{_ts()}] STARTING PROCESS FOR TABLE: {table_name}")
-    start_time = datetime.now(tz)
-    log_df = spark.createDataFrame([
-        (Today_date, table_name, "Running", None, start_time, start_time, None)
-    ], ["run_date","table_name","status","error_message","insert_timestamp","start_time","end_time","duration_sec"])
-    log_df.write.mode("append").saveAsTable("logs.daily_log")
-    return start_time
+    print(f"[{_ts()}] START TABLE: {table_name}")
+    now = datetime.now(tz)
+    df = spark.createDataFrame([
+        (Today_date, table_name, "Running", None, now, now, now, None)
+    ], ["run_date", "table_name", "status", "error_message", "insert_timestamp", "start_time", "end_time", "duration_sec"])
+    df.write.mode("append").saveAsTable("logs.daily_log")
+    return now
 
 def complete_daily_log(table_name, status, start_time, error_message=None):
     end_time = datetime.now(tz)
-    duration = (end_time - start_time).total_seconds()
-    print(f"[{_ts()}] COMPLETED TABLE: {table_name} | STATUS: {status} | Duration: {duration:.2f} seconds")
+    dur = (end_time - start_time).total_seconds()
+    print(f"[{_ts()}] END TABLE: {table_name} | STATUS: {status} | Duration: {dur:.2f}s")
     print("="*60 + "\n")
-    upd_df = spark.createDataFrame([
-        (Today_date, table_name, status, error_message, end_time, start_time, end_time, duration)
-    ], ["run_date","table_name","status","error_message","insert_timestamp","start_time","end_time","duration_sec"])
-    upd_df.write.mode("append").saveAsTable("logs.daily_log")
+    df = spark.createDataFrame([
+        (Today_date, table_name, status, error_message, end_time, start_time, end_time, dur)
+    ], ["run_date", "table_name", "status", "error_message", "insert_timestamp", "start_time", "end_time", "duration_sec"])
+    df.write.mode("append").saveAsTable("logs.daily_log")
 
-# === CHANGE DETECTION ===
+# === DELTA LOGIC ===
 def build_changes(raw_df, prev_df, key_columns, row_hash_col, table_name):
-    print(f"[{_ts()}] Building change set for: {table_name}")
-    join_keys = [F.col(f"raw.{k}") == F.col(f"prev.{k}") for k in key_columns]
+    print(f"[{_ts()}] Detecting changes for: {table_name}")
+    keys = [F.col(f"raw.{k}") == F.col(f"prev.{k}") for k in key_columns]
 
-    print(f"[{_ts()}] Detecting deletes...")
-    deletes = (
-        prev_df.alias("prev")
-        .join(raw_df.alias("raw"), on=join_keys, how="left_anti")
-        .select("prev.*")
-        .withColumn("status", F.lit("D"))
-        .withColumn("insert_ts", F.current_timestamp())
+    deletes = prev_df.alias("prev").join(raw_df.alias("raw"), keys, "left_anti")\
+        .select("prev.*").withColumn("status", F.lit("D")).withColumn("insert_ts", F.current_timestamp())\
         .withColumn("source_table", F.lit(table_name))
-    )
 
-    print(f"[{_ts()}] Detecting updates...")
-    updates = (
-        raw_df.alias("raw")
-        .join(prev_df.alias("prev"), on=join_keys, how="inner")
-        .filter(F.col(f"raw.{row_hash_col}") != F.col(f"prev.{row_hash_col}"))
-        .select("raw.*")
-        .withColumn("status", F.lit("U"))
-        .withColumn("insert_ts", F.current_timestamp())
+    updates = raw_df.alias("raw").join(prev_df.alias("prev"), keys, "inner")\
+        .filter(F.col(f"raw.{row_hash_col}") != F.col(f"prev.{row_hash_col}"))\
+        .select("raw.*").withColumn("status", F.lit("U")).withColumn("insert_ts", F.current_timestamp())\
         .withColumn("source_table", F.lit(table_name))
-    )
 
-    print(f"[{_ts()}] Detecting inserts...")
-    inserts = (
-        raw_df.alias("raw")
-        .join(prev_df.alias("prev"), on=join_keys, how="left")
-        .filter(F.col(f"prev.{key_columns[0]}").isNull())
-        .select("raw.*")
-        .withColumn("status", F.lit("I"))
-        .withColumn("insert_ts", F.current_timestamp())
+    inserts = raw_df.alias("raw").join(prev_df.alias("prev"), keys, "left")\
+        .filter(F.col(f"prev.{key_columns[0]}").isNull())\
+        .select("raw.*").withColumn("status", F.lit("I")).withColumn("insert_ts", F.current_timestamp())\
         .withColumn("source_table", F.lit(table_name))
-    )
 
     if deletes.rdd.isEmpty() and updates.rdd.isEmpty() and inserts.rdd.isEmpty():
-        print(f"[{_ts()}] No changes found for table {table_name}.")
+        print(f"[{_ts()}] No changes found.")
         return None
 
-    print(f"[{_ts()}] Change detection complete: D={deletes.count()}, U={updates.count()}, I={inserts.count()}")
+    print(f"[{_ts()}] Changes detected.")
     return deletes.unionByName(updates).unionByName(inserts)
 
-# === TABLE WRITES ===
-def write_to_temp_staging(df, table_name):
-    temp_table = f"staging.temp_stg_{table_name}"
-    print(f"[{_ts()}] Writing data to: {temp_table}")
+def write_to_temp(df, table_name):
+    print(f"[{_ts()}] Writing to staging.temp_stg_{table_name}")
+    df.write.mode("overwrite").saveAsTable(f"staging.temp_stg_{table_name}")
+
+def promote_to_final(table_name):
+    print(f"[{_ts()}] Promoting to staging.stg_{table_name}")
+    spark.sql(f"DROP TABLE IF EXISTS staging.stg_{table_name}")
+    spark.sql(f"CREATE TABLE staging.stg_{table_name} AS SELECT * FROM staging.temp_stg_{table_name}")
+    spark.sql(f"DROP TABLE IF EXISTS staging.temp_stg_{table_name}")
+
+# === FINAL LOG REPLACEMENT ===
+def consolidate_logs_to_final():
+    print(f"[{_ts()}] Consolidating logs.daily_log into logs.final_log (atomic)...")
+    df = spark.read.table("logs.daily_log").filter(F.col("run_date") == Today_date)
+    df.cache()
+    df.count()
+    temp_table = "logs._final_log_temp"
     df.write.mode("overwrite").saveAsTable(temp_table)
-    print(f"[{_ts()}] Data written to temp staging table.")
+    spark.sql("DROP TABLE IF EXISTS logs.final_log")
+    spark.sql("ALTER TABLE logs._final_log_temp RENAME TO final_log")
+    print(f"[{_ts()}] Final log updated.")
 
-def promote_to_final_staging(table_name):
-    temp_table = f"staging.temp_stg_{table_name}"
-    final_table = f"staging.stg_{table_name}"
-    print(f"[{_ts()}] Promoting {temp_table} to {final_table}")
-    spark.sql(f"DROP TABLE IF EXISTS {final_table}")
-    spark.sql(f"CREATE TABLE {final_table} AS SELECT * FROM {temp_table}")
-    spark.sql(f"DROP TABLE IF EXISTS {temp_table}")
-    print(f"[{_ts()}] Promotion to final staging completed.")
-
-# === TABLE PROCESSING ===
-def process_single_table(row):
+# === PROCESS ===
+def process_table(row):
     table_name = row["TABLE_NAME"]
-    key_columns = row["KEY_COLUMN"].split(',')
+    keys = row["KEY_COLUMN"].split(",")
     row_hash_col = "row_hash"
-    start_time = begin_daily_log(table_name)
+    start = begin_daily_log(table_name)
     try:
-        print(f"[{_ts()}] Reading RAW and PREV_RAW for {table_name}...")
+        print(f"[{_ts()}] Reading RAW and PREV_RAW for {table_name}")
         raw_df = spark.read.table(f"MHMR_LAKEHOUSE.RAW.{table_name}_RAW")
         prev_df = spark.read.table(f"MHMR_LAKEHOUSE.PREV_RAW.{table_name}_RAW_PREV")
-
-        changes_df = build_changes(raw_df, prev_df, key_columns, row_hash_col, table_name)
-
+        changes_df = build_changes(raw_df, prev_df, keys, row_hash_col, table_name)
         if changes_df is None:
-            complete_daily_log(table_name, "Succeeded", start_time)
+            complete_daily_log(table_name, "Succeeded", start)
             return
-
-        write_to_temp_staging(changes_df, table_name)
-        promote_to_final_staging(table_name)
-        complete_daily_log(table_name, "Succeeded", start_time)
-
+        write_to_temp(changes_df, table_name)
+        promote_to_final(table_name)
+        complete_daily_log(table_name, "Succeeded", start)
     except Exception as e:
-        print(f"[{_ts()}] Failed to process {table_name}: {str(e)}")
+        print(f"[{_ts()}] FAILED {table_name}: {str(e)}")
         traceback.print_exc()
-        complete_daily_log(table_name, "Failed", start_time, error_message=str(e))
+        complete_daily_log(table_name, "Failed", start, str(e))
 
-# === PROCESS ALL TABLES ===
-def process_all_tables():
+def process_all():
     ensure_log_tables_exist()
     print(f"[{_ts()}] Reading TABLES_LIST...")
-    tables_list = spark.read.table("TABLES_LIST").collect()
-    print(f"[{_ts()}] Found {len(tables_list)} tables to process.")
+    tables = spark.read.table("TABLES_LIST").collect()
+    print(f"[{_ts()}] Total tables: {len(tables)}")
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(process_single_table, row.asDict()) for row in tables_list]
+        futures = [executor.submit(process_table, row.asDict()) for row in tables]
         for future in as_completed(futures):
             future.result()
+    consolidate_logs_to_final()
 
 # === RUN ===
-process_all_tables()
+process_all()
