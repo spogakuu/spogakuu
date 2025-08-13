@@ -1,7 +1,6 @@
-# =================== SNAPSHOT APPLY (FOLLOWS STAGING TEMPLATE) ===================
+# =================== SNAPSHOT APPLY (STATUS-DRIVEN: I=INSERT, U=UPDATE; WITH PRINTS) ===================
 from pyspark.sql import SparkSession, functions as F, types as T
 from pyspark.sql.utils import AnalysisException
-from pyspark.sql.window import Window
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz, traceback, os, time
@@ -19,10 +18,10 @@ spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED"
 tz = pytz.timezone("America/Chicago")
 Today_date = datetime.now(tz).date()
 
-CATALOG = "MHMR_LAKEHOUSE"
-SNAPSHOT_SCHEMA = f"{CATALOG}.SNAPSHOT"     # e.g., MHMR_LAKEHOUSE.SNAPSHOT
-STAGING_SCHEMA  = "staging"                 # e.g., staging.stg_{TABLE_NAME}
-TABLES_LIST     = "TABLES_LIST"             # columns: TABLE_NAME, KEY_COLUMN (comma-separated)
+CATALOG         = "MHMR_LAKEHOUSE"
+SNAPSHOT_SCHEMA = f"{CATALOG}.SNAPSHOT"      # target: MHMR_LAKEHOUSE.SNAPSHOT.{table}_SNAPSHOT
+STAGING_SCHEMA  = "staging"                  # source: staging.stg_{TABLE_NAME}
+TABLES_LIST     = "TABLES_LIST"              # columns: TABLE_NAME, KEY_COLUMN (comma-separated)
 
 MAX_WORKERS = 4
 MAX_RETRIES = 2
@@ -31,7 +30,7 @@ SLEEP_BETWEEN_RETRIES = 5
 def _ts():
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-# === SNAPSHOT LOG SCHEMA (legacy-compatible daily/final) ===
+# === LOG SCHEMA (legacy-compatible daily/final) ===
 snap_log_schema = T.StructType([
     T.StructField("load_date",        T.DateType()),
     T.StructField("table_name",       T.StringType()),
@@ -46,38 +45,43 @@ snap_log_schema = T.StructType([
 
 SNAP_LOG_LOCK = "/tmp/snapshot_logs_legacy.lock"
 
+# === LOCKING ===
 def _acquire_lock(path=SNAP_LOG_LOCK, timeout=30, interval=0.2):
+    print(f"[{_ts()}] [LOCK] Attempting to acquire log lock at {path} ...")
     start = time.time()
     while os.path.exists(path):
         if time.time() - start > timeout:
+            print(f"[{_ts()}] [LOCK] Timeout waiting for {path}.")
             return False
         time.sleep(interval)
     with open(path, "w") as f:
         f.write("locked")
+    print(f"[{_ts()}] [LOCK] Acquired {path}.")
     return True
 
 def _release_lock(path=SNAP_LOG_LOCK):
     try:
         if os.path.exists(path):
             os.remove(path)
-    except:
-        pass
+            print(f"[{_ts()}] [LOCK] Released {path}.")
+    except Exception as e:
+        print(f"[{_ts()}] [LOCK] Release error ignored: {e}")
 
+# === LOGGING ===
 def ensure_snapshot_log_tables_exist():
-    print(f"[{_ts()}] Checking snapshot log tables existence (legacy mode)...")
+    print(f"[{_ts()}] Ensuring LOGS schema and snapshot log tables exist ...")
     spark.sql("CREATE SCHEMA IF NOT EXISTS LOGS")
     try:
         spark.read.table("LOGS.snapshot_daily_log")
         print(f"[{_ts()}] LOGS.snapshot_daily_log exists.")
-    except:
-        print(f"[{_ts()}] LOGS.snapshot_daily_log not found. Creating (empty)...")
+    except Exception:
+        print(f"[{_ts()}] Creating LOGS.snapshot_daily_log (empty).")
         spark.createDataFrame([], snap_log_schema).write.mode("overwrite").saveAsTable("LOGS.snapshot_daily_log")
-
     try:
         spark.read.table("LOGS.snapshot_final_log")
         print(f"[{_ts()}] LOGS.snapshot_final_log exists.")
-    except:
-        print(f"[{_ts()}] LOGS.snapshot_final_log not found. Creating (empty)...")
+    except Exception:
+        print(f"[{_ts()}] Creating LOGS.snapshot_final_log (empty).")
         spark.createDataFrame([], snap_log_schema).write.mode("overwrite").saveAsTable("LOGS.snapshot_final_log")
 
 def _legacy_write_snapshot_daily(row_df):
@@ -90,6 +94,7 @@ def _legacy_write_snapshot_daily(row_df):
             final_df = existing.unionByName(row_df)
         except Exception:
             final_df = row_df
+        print(f"[{_ts()}] Writing daily snapshot log (overwrite+union).")
         final_df.write.mode("overwrite").saveAsTable("LOGS.snapshot_daily_log")
     finally:
         _release_lock()
@@ -100,65 +105,103 @@ def complete_snapshot_daily_log(table_name, status, cnt, start_time, error_messa
         (Today_date, table_name, status, int(cnt or 0), error_message,
          end_time, start_time, end_time, "incremental")
     ], schema=snap_log_schema)
+    print(f"[{_ts()}] LOG → table={table_name}, status={status}, count={cnt}, error={bool(error_message)}")
     _legacy_write_snapshot_daily(row_df)
 
 def consolidate_snapshot_logs_to_final():
-    print(f"[{_ts()}] Consolidating LOGS.snapshot_daily_log -> LOGS.snapshot_final_log (legacy)…")
+    print(f"[{_ts()}] Consolidating LOGS.snapshot_daily_log → LOGS.snapshot_final_log ...")
     try:
         daily_df = spark.read.table("LOGS.snapshot_daily_log")
-    except:
+    except Exception:
         print(f"[{_ts()}] No snapshot_daily_log found; skipping consolidation.")
         return
 
     try:
         final_df = spark.read.table("LOGS.snapshot_final_log")
-    except:
+    except Exception:
         print(f"[{_ts()}] snapshot_final_log missing; creating from daily.")
         daily_df.write.mode("overwrite").saveAsTable("LOGS.snapshot_final_log")
         spark.sql("DROP TABLE IF EXISTS LOGS.snapshot_daily_log")
         spark.createDataFrame([], snap_log_schema).write.mode("overwrite").saveAsTable("LOGS.snapshot_daily_log")
-        print(f"[{_ts()}] Consolidation done.")
+        print(f"[{_ts()}] Consolidation done (created final, reset daily).")
         return
 
-    # De-dup by a composite key (load_date, table_name, status, end_time, count, error_message) to preserve history but avoid exact duplicates
     key_cols = ["load_date","table_name","status","end_time","count","error_message"]
     cond = [F.col(f"d.{c}") == F.col(f"f.{c}") for c in key_cols]
-    to_add = daily_df.alias("d").join(
-        final_df.select(*key_cols).alias("f"),
-        on=cond,
-        how="left_anti"
-    )
+    to_add = daily_df.alias("d").join(final_df.select(*key_cols).alias("f"), on=cond, how="left_anti")
     final_union = final_df.unionByName(to_add)
     final_union.write.mode("overwrite").saveAsTable("LOGS.snapshot_final_log")
-
     spark.sql("DROP TABLE IF EXISTS LOGS.snapshot_daily_log")
     spark.createDataFrame([], snap_log_schema).write.mode("overwrite").saveAsTable("LOGS.snapshot_daily_log")
-    print(f"[{_ts()}] Snapshot final log updated and daily log reset (legacy).")
+    print(f"[{_ts()}] Consolidation complete; daily log reset.")
 
 # === HELPERS ===
 def stg_tbl(table):   return f"{STAGING_SCHEMA}.stg_{table}"
 def snap_tbl(table):  return f"{SNAPSHOT_SCHEMA}.{table}_SNAPSHOT"
 
+def _resolve_insert_ts_col(df):
+    cols = {c.lower(): c for c in df.columns}
+    for name in ["insert_timestamp", "insert_ts", "INSERT_TIMESTAMP", "INSERT_TS"]:
+        if name.lower() in cols:
+            return cols[name.lower()]
+    raise ValueError("No insert timestamp column found (expected one of: insert_timestamp, insert_ts).")
+
+def _resolve_status_col(df):
+    for c in df.columns:
+        if c.lower() == "status":
+            return c
+    raise ValueError("No STATUS column found in staging table.")
+
+def _local_date_from_ts(ts_col_name):
+    # Spark session is UTC; derive America/Chicago calendar date
+    return F.to_date(F.from_utc_timestamp(F.col(ts_col_name), "America/Chicago"))
+
+def _staging_today(df):
+    ts_col = _resolve_insert_ts_col(df)
+    return (df
+            .withColumn("_ins_local_dt", _local_date_from_ts(ts_col))
+            .filter(F.col("_ins_local_dt") == F.lit(str(Today_date)).cast("date"))
+            .drop("_ins_local_dt"))
+
+# Create empty snapshot from staging schema (0 rows) when first-ever and no data today
+def _create_empty_snapshot_from_staging_schema(table_name, stg_full_df):
+    tgt = snap_tbl(table_name)
+    print(f"[{_ts()}] Creating EMPTY snapshot (schema only) at {tgt} ...")
+    stg_full_df.limit(0).write.mode("overwrite").saveAsTable(tgt)
+
+# Ensure snapshot exists once
 def ensure_snapshot_exists_from_staging(table_name):
     tgt = snap_tbl(table_name)
     try:
         spark.read.table(tgt)
+        print(f"[{_ts()}] Snapshot exists: {tgt}")
         return False
     except AnalysisException:
-        src = spark.read.table(stg_tbl(table_name))
-        src.write.mode("overwrite").saveAsTable(tgt)
-        # Log bootstrap as inserts; U/D == 0
+        print(f"[{_ts()}] Snapshot missing: {tgt}. Creating from staging ...")
+        stg_full = spark.read.table(stg_tbl(table_name))
+        stg_today = _staging_today(stg_full)
         start_b = datetime.now(tz)
-        complete_snapshot_daily_log(table_name, "I", src.count(), start_b, None)
-        complete_snapshot_daily_log(table_name, "U", 0, start_b, None)
-        complete_snapshot_daily_log(table_name, "D", 0, start_b, None)
-        return True
+        if stg_today.rdd.isEmpty():
+            _create_empty_snapshot_from_staging_schema(table_name, stg_full)
+            for s in ("D","I","U"):
+                complete_snapshot_daily_log(table_name, s, 0, start_b, None)
+            print(f"[{_ts()}] Empty snapshot created (no data today).")
+            return True
+        else:
+            # Bootstrap with today's rows regardless of status (preserves schema and data)
+            cnt = stg_today.count()
+            stg_today.write.mode("overwrite").saveAsTable(tgt)
+            complete_snapshot_daily_log(table_name, "D", 0, start_b, None)
+            complete_snapshot_daily_log(table_name, "I", cnt, start_b, None)
+            complete_snapshot_daily_log(table_name, "U", 0, start_b, None)
+            print(f"[{_ts()}] Snapshot bootstrapped from today's staging rows: {cnt} rows.")
+            return True
 
-# === STATUS DRIVERS (use snapshot_final_log to decide failed → pending → success order) ===
+# === DRIVER STATE (use FINAL log for today) ===
 def _today_final_logs():
     try:
         return spark.read.table("LOGS.snapshot_final_log").filter(F.col("load_date")==Today_date)
-    except:
+    except Exception:
         return spark.createDataFrame([], snap_log_schema)
 
 def table_has_failure_today(table_name):
@@ -170,36 +213,49 @@ def table_has_all_success_today(table_name):
     got = df.select("status").distinct().rdd.map(lambda r: r[0]).collect()
     return set(["I","U","D"]).issubset(set(got))
 
-# === CORE APPLY: DELETE (left-anti) → INSERTS → UPDATES ===
+# === CORE APPLY (STATUS-AWARE): D via left-anti; I inserts; U updates ===
 def apply_snapshot_for_table(table_name, key_cols):
     start_table = datetime.now(tz)
-    print(f"[{_ts()}] APPLY SNAPSHOT: {table_name} | keys={key_cols}")
+    print(f"[{_ts()}] APPLY SNAPSHOT (today only): {table_name} | keys={key_cols}")
 
     try:
-        # Validate staging presence
-        stg = spark.read.table(stg_tbl(table_name))
-        if stg.rdd.isEmpty():
-            raise ValueError(f"Staging empty for {table_name}")
+        stg_full = spark.read.table(stg_tbl(table_name))
+        stg_today = _staging_today(stg_full)  # filter to TODAY
+        status_col = _resolve_status_col(stg_full)
 
-        # Ensure snapshot exists; bootstrap from staging if needed
+        # Make sure snapshot exists (handles first run + empty-today case)
         boot = ensure_snapshot_exists_from_staging(table_name)
-        if boot:
-            print(f"[{_ts()}] Bootstrap complete for {table_name}.")
+
+        if stg_today.rdd.isEmpty():
+            print(f"[{_ts()}] No staging rows for today in {stg_tbl(table_name)}. Logging zeros and continuing.")
+            t0 = datetime.now(tz)
+            for s in ("D","I","U"):
+                complete_snapshot_daily_log(table_name, s, 0, t0, None)
             return
 
-        # Prepare key-only views
-        snap = spark.read.table(snap_tbl(table_name))
-        stg_keys  = stg.select(*key_cols).dropDuplicates()
-        snap_keys = snap.select(*key_cols).dropDuplicates()
+        if boot:
+            print(f"[{_ts()}] Snapshot created/bootstrapped for {table_name}. No further apply needed in this run.")
+            return
 
-        # --- DELETES: keys in SNAPSHOT but not in STAGING (left anti on keys)
+        snap = spark.read.table(snap_tbl(table_name))
+
+        # Prepare key sets
+        stg_keys_all = stg_today.select(*key_cols).dropDuplicates()
+        snap_keys    = snap.select(*key_cols).dropDuplicates()
+
+        # Buckets by STATUS
+        stg_I = stg_today.filter(F.upper(F.col(status_col)) == F.lit("I"))
+        stg_U = stg_today.filter(F.upper(F.col(status_col)) == F.lit("U"))
+
+        # --- DELETES (left-anti: keys present in SNAPSHOT but absent in TODAY'S staging of any status)
         start_d = datetime.now(tz)
         del_keys = snap_keys.alias("t").join(
-            stg_keys.alias("s"),
+            stg_keys_all.alias("s"),
             on=[F.col(f"t.{k}") == F.col(f"s.{k}") for k in key_cols],
             how="left_anti"
         )
         d_count = del_keys.count()
+        print(f"[{_ts()}] {table_name}: DELETE keys count = {d_count}")
         if d_count > 0:
             del_keys.createOrReplaceTempView("del_keys_vw")
             cond = " AND ".join([f"t.{k}=d.{k}" for k in key_cols])
@@ -209,83 +265,104 @@ def apply_snapshot_for_table(table_name, key_cols):
             """)
         complete_snapshot_daily_log(table_name, "D", d_count, start_d, None)
 
-        # --- INSERTS: rows in STAGING not in SNAPSHOT (anti on keys)
+        # --- INSERTS (from STATUS='I', guard with anti against existing snapshot keys)
         start_i = datetime.now(tz)
-        i_src = stg.alias("s").join(
+        i_src = stg_I.alias("s").join(
             snap_keys.alias("t"),
             on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
             how="left_anti"
         )
         i_count = i_src.count()
+        print(f"[{_ts()}] {table_name}: INSERT rows (STATUS='I' anti snapshot) = {i_count}")
 
-        # --- UPDATES: rows where keys exist in both (inner join); we MERGE "as-is"
+        # --- UPDATES (from STATUS='U', only where key exists in snapshot)
         start_u = datetime.now(tz)
-        u_src = stg.alias("s").join(
+        u_src = stg_U.alias("s").join(
             snap_keys.alias("t"),
             on=[F.col(f"s.{k}") == F.col(f"t.{k}") for k in key_cols],
             how="inner"
         )
         u_count = u_src.count()
+        print(f"[{_ts()}] {table_name}: UPDATE rows (STATUS='U' inner snapshot) = {u_count}")
 
-        # Single MERGE handles both update and insert as-is (no status column in target)
-        if i_count > 0 or u_count > 0:
-            stg.createOrReplaceTempView("src_all_vw")
-            on = " AND ".join([f"t.{k}=s.{k}" for k in key_cols])
-            all_cols = [c for c in stg.columns]  # include every column as-is
-            set_clause  = ", ".join([f"t.{c}=s.{c}" for c in all_cols])
-            insert_cols = ", ".join(all_cols)
-            insert_vals = ", ".join([f"s.{c}" for c in all_cols])
+        # If nothing to do, log and exit for this table
+        if i_count == 0 and u_count == 0:
+            print(f"[{_ts()}] {table_name}: Nothing to MERGE (I=0, U=0).")
+            complete_snapshot_daily_log(table_name, "I", 0, start_i, None)
+            complete_snapshot_daily_log(table_name, "U", 0, start_u, None)
+            print(f"[{_ts()}] DONE {table_name} | D={d_count}, I=0, U=0 | Elapsed={(datetime.now(tz)-start_table)}")
+            return
 
-            spark.sql(f"""
-                MERGE INTO {snap_tbl(table_name)} AS t
-                USING (SELECT * FROM src_all_vw) AS s
-                ON {on}
-                WHEN MATCHED THEN UPDATE SET {set_clause}
-                WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
-            """)
+        # === MERGE using op flag so updates and inserts are handled separately in one pass ===
+        i_src.createOrReplaceTempView("i_src_vw")
+        u_src.createOrReplaceTempView("u_src_vw")
+        on = " AND ".join([f"t.{k}=s.{k}" for k in key_cols])
 
-        # Write separate logs for I and U using the counts we computed
+        all_cols = [c for c in stg_today.columns if c != "_ins_local_dt"]
+        set_clause  = ", ".join([f"t.{c}=s.{c}" for c in all_cols])
+        insert_cols = ", ".join(all_cols)
+        insert_vals = ", ".join([f"s.{c}" for c in all_cols])
+
+        # Union both sources with an operation tag
+        spark.sql(f"""
+            MERGE INTO {snap_tbl(table_name)} AS t
+            USING (
+                SELECT *, 'I' AS SRC_OP FROM i_src_vw
+                UNION ALL
+                SELECT *, 'U' AS SRC_OP FROM u_src_vw
+            ) AS s
+            ON {on}
+            WHEN MATCHED AND s.SRC_OP = 'U' THEN UPDATE SET {set_clause}
+            WHEN NOT MATCHED AND s.SRC_OP = 'I' THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+        """)
+
+        # Log I / U with their specific counts
         complete_snapshot_daily_log(table_name, "I", i_count, start_i, None)
         complete_snapshot_daily_log(table_name, "U", u_count, start_u, None)
 
-        print(f"[{_ts()}] DONE {table_name} | D={d_count}, I={i_count}, U={u_count} | {datetime.now(tz)-start_table}")
+        print(f"[{_ts()}] DONE {table_name} | D={d_count}, I={i_count}, U={u_count} | Elapsed={(datetime.now(tz)-start_table)}")
+
     except Exception as e:
-        # On any failure, record an error on 'U' to ensure the controller prioritizes this table
         msg = f"{type(e).__name__}: {str(e)}"
         traceback.print_exc()
         complete_snapshot_daily_log(table_name, "U", 0, start_table, msg)
+        print(f"[{_ts()}] FAILED {table_name}: {msg}")
         raise
 
+# === RETRY WRAPPER ===
 def apply_with_retry(row):
     table_name = row["TABLE_NAME"]
     key_cols = [c.strip() for c in row["KEY_COLUMN"].split(",")]
     attempts = 0
     while True:
         try:
+            print(f"[{_ts()}] Starting table: {table_name} (attempt {attempts+1})")
             apply_snapshot_for_table(table_name, key_cols)
+            print(f"[{_ts()}] Finished table: {table_name}")
             return
-        except Exception:
+        except Exception as e:
             attempts += 1
             if attempts > MAX_RETRIES:
-                print(f"[{_ts()}] FINAL FAILURE after retries: {table_name}")
+                print(f"[{_ts()}] FINAL FAILURE after {MAX_RETRIES} retries: {table_name} | {e}")
                 return
             print(f"[{_ts()}] RETRY {attempts}/{MAX_RETRIES} for {table_name} in {SLEEP_BETWEEN_RETRIES}s …")
             time.sleep(SLEEP_BETWEEN_RETRIES)
 
-# === MAIN PROCESS (failed → all pending → already success) ===
+# === MAIN PROCESS (failed → pending → success) ===
 def process_all_snapshot():
     ensure_snapshot_log_tables_exist()
 
-    print(f"[{_ts()}] Reading TABLES_LIST...")
+    print(f"[{_ts()}] Reading TABLES_LIST ...")
     tables_df = spark.read.table(TABLES_LIST).select("TABLE_NAME","KEY_COLUMN")
     all_rows = [r.asDict() for r in tables_df.collect()]
+    print(f"[{_ts()}] TABLES_LIST count: {len(all_rows)}")
 
-    # Build queues from FINAL log (today) to follow your driver order
+    # Build queues using FINAL log (today)
     failed, pending, success = [], [], []
     for r in all_rows:
         t = r["TABLE_NAME"]
         if table_has_failure_today(t):
-            print(f"[{_ts()}] Queue FAILED: {t}")
+            print(f"[{_ts()}] Queue FAILED-FIRST: {t}")
             failed.append(r)
         elif table_has_all_success_today(t):
             print(f"[{_ts()}] Queue SUCCESS-LAST: {t}")
@@ -295,6 +372,7 @@ def process_all_snapshot():
             pending.append(r)
 
     queue = failed + pending + success
+    print(f"[{_ts()}] Execution order → Failed: {len(failed)} | Pending: {len(pending)} | Success: {len(success)}")
     if not queue:
         print(f"[{_ts()}] Nothing to process for snapshot apply.")
         return
@@ -305,7 +383,8 @@ def process_all_snapshot():
             fut.result()
 
     consolidate_snapshot_logs_to_final()
+    print(f"[{_ts()}] All done.")
 
 # === RUN ===
 process_all_snapshot()
-# =================================================================
+# ===============================================================================================
