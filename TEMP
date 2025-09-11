@@ -1,76 +1,84 @@
 # ==============================================================
-# INITIAL LOAD — RAW ➜ SNAPSHOT
-# Enforce column order: ... , status, insert_ts, row_hash
-# Create snapshot if missing; INSERT ONLY (no TRUNCATE)
+# ONE-TIME INITIAL LOAD — RAW ➜ HISTORY (no logs, insert-only)
+# Trailing column order enforced: ..., status, insert_ts, FLAG, ROW_HASH
 # ==============================================================
 
 from pyspark.sql import SparkSession, functions as F
 from datetime import datetime
 import pytz, traceback
 
-spark = SparkSession.builder.appName("Initial Load RAW->SNAPSHOT (ordered)").getOrCreate()
+# ---------- Spark ----------
+spark = SparkSession.builder.appName("Initial Load RAW->HISTORY").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
+# ---------- Time ----------
 tz = pytz.timezone("America/Chicago")
 def _ts():
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-CATALOG = "MHMR_LAKEHOUSE"
+# ---------- Constants ----------
+CATALOG      = "MHMR_LAKEHOUSE"
 RAW_SCHEMA   = f"{CATALOG}.RAW"
-SNAP_SCHEMA  = f"{CATALOG}.SNAPSHOT"
-TEMP_SCHEMA  = f"{CATALOG}.SNAPSHOT_TEMP"
+HIST_SCHEMA  = f"{CATALOG}.HISTORY"
+TEMP_SCHEMA  = f"{CATALOG}.HISTORY_TEMP"
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SNAP_SCHEMA}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {HIST_SCHEMA}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TEMP_SCHEMA}")
 
-def ensure_snapshot_table(final_tbl: str, zero_df):
+# ---------- Helpers ----------
+def ensure_history_table(final_tbl: str, raw_df):
     """
-    Create {final_tbl} only if it doesn't exist, with exact order:
-    <all RAW columns except row_hash> + [status STRING, insert_ts TIMESTAMP, row_hash (from RAW)]
+    Create HISTORY table if missing with exact column order:
+    <all RAW columns except ROW_HASH> + status (STRING) + insert_ts (TIMESTAMP) + FLAG (STRING) + ROW_HASH (STRING)
     """
     if spark._jsparkSession.catalog().tableExists(final_tbl):
         return
-    print(f"[{_ts()}] Creating missing snapshot table with enforced order: {final_tbl}")
-    raw_cols = [c for c in zero_df.columns if c.lower() != "row_hash"]
+    print(f"[{_ts()}] Creating missing history table with enforced order: {final_tbl}")
+
+    # Build a zero-row DF with the exact target schema/order.
+    raw_cols_wo_hash = [c for c in raw_df.columns if c.upper() != "ROW_HASH"]
     schema_df = (
-        zero_df.select(*raw_cols)                              # all business cols (no row_hash)
-        .withColumn("status", F.lit("I"))                      # STRING
+        raw_df.select(*raw_cols_wo_hash)
+        .withColumn("status",    F.lit("I"))  # STRING
         .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))  # TIMESTAMP
-        .withColumn("row_hash", F.lit(None).cast("string"))    # placeholder to set type/position
+        .withColumn("FLAG",      F.lit("A"))  # STRING (initial active)
+        .withColumn("ROW_HASH",  F.lit(None).cast("string"))  # ensure type & final position
     )
-    # write empty table with the exact target schema/order
+
     schema_df.limit(0).write.mode("ignore").saveAsTable(final_tbl)
 
 def load_one(row_dict):
     table_name = row_dict["TABLE_NAME"]
     raw_tbl   = f"{RAW_SCHEMA}.{table_name}_RAW"
-    temp_tbl  = f"{TEMP_SCHEMA}.{table_name}_SNAPSHOT_TEMP"
-    final_tbl = f"{SNAP_SCHEMA}.{table_name}_SNAPSHOT"
+    temp_tbl  = f"{TEMP_SCHEMA}.{table_name}_HIST_TEMP"
+    final_tbl = f"{HIST_SCHEMA}.{table_name}_HIST"
 
     try:
         print(f"[{_ts()}] Reading {raw_tbl}")
         raw_df = spark.read.table(raw_tbl)
 
-        # Ensure final snapshot exists
-        ensure_snapshot_table(final_tbl, raw_df)
+        # Ensure final HISTORY table exists with correct trailing columns & types.
+        ensure_history_table(final_tbl, raw_df)
 
         # Build outgoing DF with enforced order:
-        # all RAW cols except ROW_HASH, then status, insert_ts, then ROW_HASH last
+        # <all RAW cols except ROW_HASH> + status + insert_ts + FLAG + ROW_HASH
         raw_cols_wo_hash = [c for c in raw_df.columns if c.upper() != "ROW_HASH"]
         out_df = (
-            raw_df.select(*raw_cols_wo_hash)  # business columns only
-            .withColumn("status", F.lit("I"))
+            raw_df.select(*raw_cols_wo_hash)
+            .withColumn("status",    F.lit("I"))
             .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
-            .withColumn("ROW_HASH", F.col("ROW_HASH"))  # append ROW_HASH last, preserving its values
+            .withColumn("FLAG",      F.lit("A"))
+            .withColumn("ROW_HASH",  F.col("ROW_HASH"))
         )
 
-        print(f"[{_ts()}] Writing temp snapshot for {table_name}")
+        print(f"[{_ts()}] Writing temp history for {table_name}")
         out_df.write.mode("overwrite").saveAsTable(temp_tbl)
 
-        # Explicit insert by column names (to avoid type/order mismatch)
+        # Insert by explicit column list to avoid any position/type mismatch.
         final_cols = [f.name for f in spark.table(final_tbl).schema]
         col_list = ", ".join(final_cols)
+        print(f"[{_ts()}] Inserting rows into {final_tbl}")
         spark.sql(f"INSERT INTO {final_tbl} ({col_list}) SELECT {col_list} FROM {temp_tbl}")
 
         spark.sql(f"DROP TABLE IF EXISTS {temp_tbl}")
@@ -84,8 +92,7 @@ def load_one(row_dict):
         except:
             pass
 
-
-def run_initial_load(max_workers=4):
+def run_initial_history_load(max_workers=4):
     print(f"[{_ts()}] Reading TABLES_LIST …")
     tables_df = spark.read.table("TABLES_LIST")
     rows = [r.asDict() for r in tables_df.collect()]
@@ -97,4 +104,4 @@ def run_initial_load(max_workers=4):
             f.result()
 
 if __name__ == "__main__":
-    run_initial_load(max_workers=4)
+    run_initial_history_load(max_workers=4)
