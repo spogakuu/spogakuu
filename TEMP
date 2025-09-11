@@ -52,27 +52,25 @@ def load_one(row_dict):
         print(f"[{_ts()}] Reading {raw_tbl}")
         raw_df = spark.read.table(raw_tbl)
 
-        # Build outgoing DF with enforced order: <all RAW cols except row_hash> + status + insert_ts + row_hash
-        raw_cols_wo_hash = [c for c in raw_df.columns if c.lower() != "row_hash"]
+        # Ensure final snapshot exists
+        ensure_snapshot_table(final_tbl, raw_df)
+
+        # Build outgoing DF with enforced order:
+        # all RAW cols except ROW_HASH, then status, insert_ts, then ROW_HASH last
+        raw_cols_wo_hash = [c for c in raw_df.columns if c.upper() != "ROW_HASH"]
         out_df = (
-            raw_df.select(*raw_cols_wo_hash)  # keep business columns first
+            raw_df.select(*raw_cols_wo_hash)  # business columns only
             .withColumn("status", F.lit("I"))
             .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
-            .withColumn("row_hash", F.col("row_hash"))  # append row_hash last, preserving RAW's value
+            .withColumn("ROW_HASH", F.col("ROW_HASH"))  # append ROW_HASH last, preserving its values
         )
-
-        # Make sure final table exists with the same three trailing columns/types
-        ensure_snapshot_table(final_tbl, raw_df)
 
         print(f"[{_ts()}] Writing temp snapshot for {table_name}")
         out_df.write.mode("overwrite").saveAsTable(temp_tbl)
 
-        # Build explicit column list to insert by name (avoid position-based casting)
-        final_cols = [f.name for f in spark.table(final_tbl).schema]   # whatever order the final has
-        # Ensure the required trailing order is present in final schema
-        # If legacy table exists with different order, this still works because we list columns explicitly.
+        # Explicit insert by column names (to avoid type/order mismatch)
+        final_cols = [f.name for f in spark.table(final_tbl).schema]
         col_list = ", ".join(final_cols)
-        print(f"[{_ts()}] Inserting into {final_tbl} (by explicit columns)")
         spark.sql(f"INSERT INTO {final_tbl} ({col_list}) SELECT {col_list} FROM {temp_tbl}")
 
         spark.sql(f"DROP TABLE IF EXISTS {temp_tbl}")
@@ -85,6 +83,7 @@ def load_one(row_dict):
             spark.sql(f"DROP TABLE IF EXISTS {temp_tbl}")
         except:
             pass
+
 
 def run_initial_load(max_workers=4):
     print(f"[{_ts()}] Reading TABLES_LIST …")
