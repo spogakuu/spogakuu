@@ -1,101 +1,398 @@
-from pyspark.sql import SparkSession, functions as F
+# run_qna_excel.py
+import os, json, re, time
+from pathlib import Path
+from dotenv import load_dotenv
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import pytz, traceback
 
-# --- INIT SPARK ---
-spark = SparkSession.builder.appName("Update ROW_HASH for RAW tables").getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "UTC")
-spark.conf.set("spark.sql.parquet.int96RebaseModeInRead", "CORRECTED")
-spark.conf.set("spark.sql.parquet.int96RebaseModeInWrite", "CORRECTED")
-spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED")
-spark.conf.set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "CORRECTED")
+# Excel output
+import pandas as pd
 
-tz = pytz.timezone("America/Chicago")
-def _ts(): return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+# --------------------------------
+# Config
+# --------------------------------
+load_dotenv()
+API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # default to GPT-5
+RAW_FILE = Path(os.getenv("RAW_FILE", ".venv/data/raw/0910.json"))
+OUT_DIR = Path(os.getenv("OUT_DIR", "out")); OUT_DIR.mkdir(parents=True, exist_ok=True)
+XLSX_PATH = OUT_DIR / "qna_final.xlsx"
 
-CATALOG = "MHMR_LAKEHOUSE"
-RAW_SCHEMA = f"{CATALOG}.RAW"
+# --------------------------------
+# System prompt
+# --------------------------------
+AI_SYSTEM = (
+    "You are a precise support-triage analyst. Given a Microsoft Teams thread, return STRICT JSON:\n"
+    "{\n"
+    "  \"is_question\": true|false,\n"
+    "  \"canonical_question\": string,\n"
+    "  \"summary\": string,\n"
+    "  \"status\": \"answered\"|\"unanswered\"|\"needs_followup\",\n"
+    "  \"answer_quality\": \"good\"|\"weak\"|\"none\",\n"
+    "  \"suggested_labels\": [string],\n"
+    "  \"improvement_suggestion\": string,\n"
+    "  \"answer\": {\n"
+    "      \"text\": string,\n"
+    "      \"author\": string,\n"
+    "      \"timestamp\": string\n"
+    "  } | null\n"
+    "}\n"
+    "Rules: If no genuine product question, set is_question=false and answer=null. "
+    "Prefer replies that actually solve or instruct; ignore placeholders like 'we are working on it'. "
+    "Output JSON only."
+)
 
-# --- Exclude columns from hashing ---
-EXCLUDE = {"ROW_HASH", "INSERT_TIMESTAMP", "UTCTimestamp", "STATUS"}
+# --------------------------------
+# Token usage tracker
+# --------------------------------
+class TokenTracker:
+    def __init__(self):
+        self.prompt = 0
+        self.completion = 0
+        self.total = 0
+    def add(self, usage):
+        if not usage: return
+        self.prompt += int(usage.get("prompt_tokens", 0))
+        self.completion += int(usage.get("completion_tokens", 0))
+        self.total += int(usage.get("total_tokens", 0))
+    def line(self):
+        return f"[{datetime.now().isoformat(timespec='seconds')}] daily_usage prompt={self.prompt:,} completion={self.completion:,} total={self.total:,}"
 
-def _find_row_hash_name(cols):
-    for c in cols:
-        if c.upper() == "ROW_HASH":
-            return c
-    return None
+TOKENS = TokenTracker()
 
-def build_hash_df(df, key_col):
-    """Return DataFrame with key and NEW_ROW_HASH column."""
-    exclude_upper = {c.upper() for c in EXCLUDE}
-    cols_keep = [f.name for f in df.schema.fields if f.name.upper() not in exclude_upper]
+# --------------------------------
+# OpenAI call (Responses API; no temperature)
+# --------------------------------
+def openai_chat(model, system_prompt, user_prompt, api_key, retries=3, use_responses=True):
+    """
+    Returns (content, usage_dict). Uses /v1/responses by default for GPT-5.
+    Prints per-request token usage. Falls back to /v1/chat/completions only if use_responses=False.
+    """
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
 
-    if key_col not in cols_keep:
-        cols_keep = [key_col] + [c for c in cols_keep if c != key_col]
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    cleaned = []
-    for c in cols_keep:
-        cleaned.append(
-            F.upper(
-                F.regexp_replace(
-                    F.when(F.col(c).isNull(), F.lit("")).otherwise(F.trim(F.col(c).cast("string"))),
-                    r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\uFEFF]',
-                    ""
-                )
-            ).alias(c)
+    def _post(url, payload):
+        import requests
+        last_err = None
+        for a in range(retries):
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=90)
+                if r.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(1.5 * (a + 1)); continue
+                if r.status_code >= 400:
+                    try:
+                        err = r.json()
+                    except Exception:
+                        err = {"error": {"message": r.text}}
+                    raise RuntimeError(f"{r.status_code} {r.reason}: {json.dumps(err, ensure_ascii=False)}")
+                return r.json()
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5)
+        raise last_err or RuntimeError("Request failed after retries")
+
+    if use_responses:
+        url = "https://api.openai.com/v1/responses"
+        payload = {
+            "model": model,
+            "input": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        }
+        data = _post(url, payload)
+
+        content = data.get("output_text")
+        if content is None:
+            parts = []
+            for item in data.get("output", []) or []:
+                for part in item.get("content", []) or []:
+                    if part.get("type") in ("output_text", "text"):
+                        parts.append(part.get("text", ""))
+            content = "".join(parts)
+
+        usage = data.get("usage", {}) or {}
+        p = usage.get("prompt_tokens", 0); c = usage.get("completion_tokens", 0); t = usage.get("total_tokens", 0)
+        print(f"   ↳ usage prompt={p:,} completion={c:,} total={t:,}")
+        return content, usage
+
+    else:
+        # Legacy fallback (not recommended for gpt-5)
+        url = "https://api.openai.com/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role":"system","content":system_prompt},
+                {"role":"user","content":user_prompt}
+            ]
+        }
+        data = _post(url, payload)
+        content = data["choices"][0]["message"]["content"]
+        usage = data.get("usage", {}) or {}
+        p = usage.get("prompt_tokens", 0); c = usage.get("completion_tokens", 0); t = usage.get("total_tokens", 0)
+        print(f"   ↳ usage prompt={p:,} completion={c:,} total={t:,}")
+        return content, usage
+
+# --------------------------------
+# Robust loaders & sanitizers
+# --------------------------------
+def load_chat_envelope_or_list(path: Path):
+    """
+    Accepts either:
+      1) a chat envelope with keys like chatId/chatType/topic/members/messages, or
+      2) an already-flat list[message].
+    Returns a flat list[message] normalized with channel/displayName + channelId.
+    """
+    # UTF-8 with BOM handling; avoids Windows cp1252 decode errors
+    with path.open("r", encoding="utf-8-sig") as f:
+        doc = json.load(f)
+
+    if isinstance(doc, list):
+        return _sanitize_and_normalize(doc, channel_name=None, channel_id=None)
+
+    # Envelope with messages
+    chat_id  = doc.get("chatId") or doc.get("id") or "unknown-chat"
+    topic    = doc.get("topic")
+    ch_name  = topic or f"Chat: {chat_id}"
+    ch_id    = chat_id
+    msgs     = doc.get("messages") or []
+    return _sanitize_and_normalize(msgs, channel_name=ch_name, channel_id=ch_id)
+
+def _sanitize_and_normalize(msgs, channel_name, channel_id):
+    flat = []
+    for i, m in enumerate(msgs):
+        # If an element is a JSON string, try to parse it; otherwise skip
+        if isinstance(m, str):
+            try:
+                m = json.loads(m)
+            except Exception:
+                print(f"   ! Skipping non-JSON string at index {i}: {m[:40]}...")
+                continue
+        if not isinstance(m, dict):
+            print(f"   ! Skipping non-dict at index {i}: type={type(m).__name__}")
+            continue
+
+        m2 = dict(m)  # shallow copy
+        m2.setdefault("replyToId", m2.get("replyToId") or m2.get("replyTo") or None)
+
+        # Normalize 'from.user'
+        u = ((m2.get("from") or {}).get("user") or {})
+        m2["from"] = {"user": {
+            "id": u.get("id", "unknown"),
+            "displayName": u.get("displayName", "Unknown")
+        }}
+
+        # Normalize 'body'
+        b = (m2.get("body") or {})
+        m2["body"] = {
+            "contentType": b.get("contentType", "html"),
+            "content": b.get("content", "")
+        }
+
+        # Add lightweight channel info so get_channel_name() works
+        if channel_name:
+            m2["channel"] = {"displayName": channel_name}
+        else:
+            m2["channel"] = m2.get("channel") or {"displayName": "Chat"}
+        m2["channelId"] = m2.get("channelId") or channel_id or "chat-unknown"
+
+        # Minimal required fields guard
+        if not m2.get("id"):
+            print(f"   ! Skipping item missing 'id' at index {i}")
+            continue
+        flat.append(m2)
+    return flat
+
+# --------------------------------
+# Helpers
+# --------------------------------
+def clean_html(s: str) -> str:
+    s = s or ""
+    s = re.sub("<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def build_threads(messages):
+    """
+    Groups messages by their root id. Resilient to non-dict entries.
+    """
+    by_root = {}
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            print(f"   ! Skipping non-dict in build_threads at index {i}: {type(m).__name__}")
+            continue
+        rid = m.get("replyToId") or m.get("replyTo") or m.get("id")
+        if not rid:
+            continue
+        by_root.setdefault(rid, []).append(m)
+    for rid in by_root:
+        by_root[rid].sort(key=lambda x: x.get("createdDateTime", ""))
+    return by_root
+
+def thread_text(msgs, max_chars=3500):
+    parts = []
+    for m in msgs:
+        author = ((m.get("from") or {}).get("user") or {}).get("displayName") or "Unknown"
+        when = m.get("createdDateTime") or ""
+        txt = clean_html((m.get("body") or {}).get("content", ""))
+        if txt:
+            parts.append(f"{author} [{when}]: {txt}")
+    return "\n".join(parts)[:max_chars]
+
+def first_acknowledgement(msgs):
+    """Return (author, timestamp, text) for the first reply not by the asker. Else (None,None,None)."""
+    if not msgs: return (None, None, None)
+    asker_id = (((msgs[0].get("from") or {}).get("user") or {}).get("id") or "").lower()
+    for m in msgs[1:]:
+        u = (m.get("from") or {}).get("user") or {}
+        uid = (u.get("id") or "").lower()
+        if uid == asker_id:
+            continue
+        author = u.get("displayName") or "Unknown"
+        ts = m.get("createdDateTime") or ""
+        txt = clean_html((m.get("body") or {}).get("content", ""))
+        if txt:
+            return (author, ts, txt)
+    return (None, None, None)
+
+def get_channel_name(root_msg):
+    ch = (root_msg.get("channel") or {}).get("displayName")
+    if ch: return ch
+    cid = root_msg.get("channelId")
+    return ch or cid or "Unknown"
+
+# --------------------------------
+# Main
+# --------------------------------
+def main():
+    if not API_KEY:
+        raise SystemExit("Set OPENAI_API_KEY (env or .env).")
+    if not RAW_FILE.exists():
+        raise SystemExit(f"Missing input file: {RAW_FILE}")
+
+    data = load_chat_envelope_or_list(RAW_FILE)
+    print(f"Using model: {MODEL}")
+    print(f"Loaded {len(data)} messages from {RAW_FILE.name}")
+
+    # Quick sanity signal if any non-dict slipped through
+    non_dict = [x for x in data if not isinstance(x, dict)]
+    if non_dict:
+        print(f"   ! Non-dict items detected: {len(non_dict)} (skipped automatically)")
+
+    threads = build_threads(data)
+    print(f"Found {len(threads)} threads\n")
+
+    rows = []
+    for i, (root_id, msgs) in enumerate(threads.items(), 1):
+        root = msgs[0]
+        reporter = ((root.get("from") or {}).get("user") or {}).get("displayName") or "Unknown"
+        reported_date = root.get("createdDateTime") or ""
+        reported_channel = get_channel_name(root)
+
+        ttext = thread_text(msgs)
+        if not ttext.strip():
+            continue
+
+        user_prompt = (
+            "Thread transcript (each line: Author [ISO time]: text). "
+            "Return JSON only, following the schema strictly.\n-----\n"
+            f"{ttext}\n-----"
         )
 
-    tmp = df.select(*cleaned)
-    ordered = sorted([c for c in tmp.columns if c != key_col])
-    hash_input = F.concat_ws("||", F.col(key_col), *[F.col(c) for c in ordered]) if ordered else F.col(key_col)
-    return tmp.select(F.col(key_col), F.md5(hash_input).alias("NEW_ROW_HASH"))
+        print(f"[{i}] ThreadID={root_id}")
+        try:
+            raw, usage = openai_chat(MODEL, AI_SYSTEM, user_prompt, API_KEY, use_responses=True)
+            TOKENS.add(usage)
+            print("   " + TOKENS.line())
+        except Exception as e:
+            print(f"   ! API error: {e}")
+            continue
 
-def update_row_hash(table_name, key_col):
-    raw_tbl = f"{RAW_SCHEMA}.{table_name}_RAW"
+        m = re.search(r"\{.*\}", raw, re.S)
+        try:
+            result = json.loads(m.group(0) if m else raw)
+        except Exception:
+            print(f"   ! Could not parse AI output:\n{raw}\n")
+            continue
+
+        if not result.get("is_question", False):
+            continue
+
+        canonical_q = result.get("canonical_question") or clean_html((root.get("body") or {}).get("content",""))
+        status = result.get("status") or "unanswered"
+
+        ack_author, ack_time, ack_text = first_acknowledgement(msgs)
+        ai_ans = result.get("answer")
+        if ai_ans:
+            ack_author = ai_ans.get("author") or ack_author
+            ack_time = ai_ans.get("timestamp") or ack_time
+            ack_text = ai_ans.get("text") or ack_text
+
+        rows.append({
+            "Reported Date": reported_date,
+            "Reported By User": reporter,
+            "Reported Channel": reported_channel,
+            "Issue Description": canonical_q,
+            "On Call Associate": ack_author or "",
+            "Status": status,
+            "Acknowledged Date": ack_time or "",
+            "Last Acknowledge Comment": ack_text or ""
+        })
+
+    # EXACT column order
+    columns = [
+        "Reported Date",
+        "Reported By User",
+        "Reported Channel",
+        "Issue Description",
+        "On Call Associate",
+        "Status",
+        "Acknowledged Date",
+        "Last Acknowledge Comment"
+    ]
+
+    df = pd.DataFrame(rows, columns=columns)
+
+    # Prefer xlsxwriter for better formatting; fallback to openpyxl if missing
     try:
-        print(f"[{_ts()}] Reading RAW table: {raw_tbl}")
-        df_raw = spark.read.table(raw_tbl)
+        import xlsxwriter  # noqa: F401
+        engine = "xlsxwriter"
+    except Exception:
+        engine = "openpyxl"
 
-        if key_col not in df_raw.columns:
-            raise ValueError(f"Key column '{key_col}' not found in RAW table {raw_tbl}")
+    with pd.ExcelWriter(XLSX_PATH, engine=engine) as writer:
+        sheet = "QnA"
+        df.to_excel(writer, index=False, sheet_name=sheet)
 
-        hash_df = build_hash_df(df_raw, key_col)
+        if engine == "xlsxwriter":
+            wb = writer.book
+            ws = writer.sheets[sheet]
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, max(len(df), 1), len(columns) - 1)
+            header_fmt = wb.add_format({"bold": True})
+            for col_idx, col_name in enumerate(columns):
+                ws.write(0, col_idx, col_name, header_fmt)
+                # autosize columns up to 60 chars
+                max_len = max([len(str(col_name))] + [len(str(v)) for v in df[col_name].astype(str).tolist()]) if not df.empty else len(col_name)
+                ws.set_column(col_idx, col_idx, min(max_len + 2, 60))
+        else:
+            # openpyxl basic formatting
+            try:
+                from openpyxl.utils import get_column_letter
+                ws = writer.sheets[sheet]
+                ws.freeze_panes = "A2"
+                # autofilter
+                ws.auto_filter.ref = ws.dimensions
+                # widths
+                for i, col_name in enumerate(columns, start=1):
+                    max_len = max([len(str(col_name))] + [len(str(v)) for v in df[col_name].astype(str).tolist()]) if not df.empty else len(col_name)
+                    ws.column_dimensions[get_column_letter(i)].width = min(max_len + 2, 60)
+            except Exception:
+                pass
 
-        # Drop existing ROW_HASH, join new one
-        row_hash_col = _find_row_hash_name(df_raw.columns)
-        base_cols = [c for c in df_raw.columns if c != row_hash_col] if row_hash_col else df_raw.columns
-        base_df = df_raw.select(*base_cols)
-
-        joined = (
-            base_df.alias("b")
-            .join(hash_df.alias("h"), on=key_col, how="left")
-            .withColumn("ROW_HASH", F.col("h.NEW_ROW_HASH"))
-            .drop("NEW_ROW_HASH")
-        )
-
-        print(f"[{_ts()}] Writing updated RAW table: {raw_tbl}")
-        (joined.write
-               .format("delta")
-               .mode("overwrite")
-               .option("overwriteSchema", "true")
-               .saveAsTable(raw_tbl))
-
-        print(f"[{_ts()}] ✅ ROW_HASH updated for {raw_tbl}")
-    except Exception as e:
-        print(f"[{_ts()}] ❌ Failed {raw_tbl}: {e}")
-        traceback.print_exc()
-
-def run_update(max_workers=4):
-    print(f"[{_ts()}] Reading TABLES_LIST …")
-    # Expect TABLES_LIST to have TABLE_NAME and KEY_COLUMN
-    tables_df = spark.read.table("TABLES_LIST")
-    rows = [r.asDict() for r in tables_df.collect()]
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(update_row_hash, r["TABLE_NAME"], r["KEY_COLUMN"]) for r in rows]
-        for f in as_completed(futs):
-            f.result()
+    print(f"\n✅ Wrote {XLSX_PATH} with {len(df)} rows.")
+    print("✅ " + TOKENS.line())
+    print("Note: With org data sharing enabled, GPT-5 requests up to 250,000 tokens/day draw from the complimentary pool.")
 
 if __name__ == "__main__":
-    run_update(max_workers=4)
+    main()
