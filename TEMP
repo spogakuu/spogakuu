@@ -1,12 +1,14 @@
 # ==============================================================
-# INITIAL LOAD — RAW ➜ SNAPSHOT (create if missing, insert only)
+# INITIAL LOAD — RAW ➜ SNAPSHOT
+# Enforce column order: ... , status, insert_ts, row_hash
+# Create snapshot if missing; INSERT ONLY (no TRUNCATE)
 # ==============================================================
 
 from pyspark.sql import SparkSession, functions as F
 from datetime import datetime
 import pytz, traceback
 
-spark = SparkSession.builder.appName("Initial Load RAW->SNAPSHOT").getOrCreate()
+spark = SparkSession.builder.appName("Initial Load RAW->SNAPSHOT (ordered)").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
 
@@ -15,52 +17,65 @@ def _ts():
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 CATALOG = "MHMR_LAKEHOUSE"
-RAW_SCHEMA  = f"{CATALOG}.RAW"
-SNAP_SCHEMA = f"{CATALOG}.SNAPSHOT"
-TEMP_SCHEMA = f"{CATALOG}.SNAPSHOT_TEMP"
+RAW_SCHEMA   = f"{CATALOG}.RAW"
+SNAP_SCHEMA  = f"{CATALOG}.SNAPSHOT"
+TEMP_SCHEMA  = f"{CATALOG}.SNAPSHOT_TEMP"
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SNAP_SCHEMA}")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {TEMP_SCHEMA}")
 
-def ensure_snapshot_table(final_tbl: str, sample_df):
-    """Create {final_tbl} only if it does not exist."""
+def ensure_snapshot_table(final_tbl: str, zero_df):
+    """
+    Create {final_tbl} only if it doesn't exist, with exact order:
+    <all RAW columns except row_hash> + [status STRING, insert_ts TIMESTAMP, row_hash (from RAW)]
+    """
     if spark._jsparkSession.catalog().tableExists(final_tbl):
         return
-    print(f"[{_ts()}] Creating missing snapshot table: {final_tbl}")
-    empty = (
-        sample_df.limit(0)
-        .withColumn("status", F.lit("I"))
-        .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
+    print(f"[{_ts()}] Creating missing snapshot table with enforced order: {final_tbl}")
+    raw_cols = [c for c in zero_df.columns if c.lower() != "row_hash"]
+    schema_df = (
+        zero_df.select(*raw_cols)                              # all business cols (no row_hash)
+        .withColumn("status", F.lit("I"))                      # STRING
+        .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))  # TIMESTAMP
+        .withColumn("row_hash", F.lit(None).cast("string"))    # placeholder to set type/position
     )
-    empty.write.mode("ignore").saveAsTable(final_tbl)
+    # write empty table with the exact target schema/order
+    schema_df.limit(0).write.mode("ignore").saveAsTable(final_tbl)
 
 def load_one(row_dict):
     table_name = row_dict["TABLE_NAME"]
-    raw_tbl  = f"{RAW_SCHEMA}.{table_name}_RAW"
-    temp_tbl = f"{TEMP_SCHEMA}.{table_name}_SNAPSHOT_TEMP"
+    raw_tbl   = f"{RAW_SCHEMA}.{table_name}_RAW"
+    temp_tbl  = f"{TEMP_SCHEMA}.{table_name}_SNAPSHOT_TEMP"
     final_tbl = f"{SNAP_SCHEMA}.{table_name}_SNAPSHOT"
 
     try:
         print(f"[{_ts()}] Reading {raw_tbl}")
         raw_df = spark.read.table(raw_tbl)
 
-        # Ensure snapshot exists
-        ensure_snapshot_table(final_tbl, raw_df)
-
-        # Add status + CST insert_ts
+        # Build outgoing DF with enforced order: <all RAW cols except row_hash> + status + insert_ts + row_hash
+        raw_cols_wo_hash = [c for c in raw_df.columns if c.lower() != "row_hash"]
         out_df = (
-            raw_df
+            raw_df.select(*raw_cols_wo_hash)  # keep business columns first
             .withColumn("status", F.lit("I"))
             .withColumn("insert_ts", F.from_utc_timestamp(F.current_timestamp(), "America/Chicago"))
+            .withColumn("row_hash", F.col("row_hash"))  # append row_hash last, preserving RAW's value
         )
+
+        # Make sure final table exists with the same three trailing columns/types
+        ensure_snapshot_table(final_tbl, raw_df)
 
         print(f"[{_ts()}] Writing temp snapshot for {table_name}")
         out_df.write.mode("overwrite").saveAsTable(temp_tbl)
 
-        print(f"[{_ts()}] Inserting rows into {final_tbl}")
-        spark.sql(f"INSERT INTO {final_tbl} SELECT * FROM {temp_tbl}")
-        spark.sql(f"DROP TABLE IF EXISTS {temp_tbl}")
+        # Build explicit column list to insert by name (avoid position-based casting)
+        final_cols = [f.name for f in spark.table(final_tbl).schema]   # whatever order the final has
+        # Ensure the required trailing order is present in final schema
+        # If legacy table exists with different order, this still works because we list columns explicitly.
+        col_list = ", ".join(final_cols)
+        print(f"[{_ts()}] Inserting into {final_tbl} (by explicit columns)")
+        spark.sql(f"INSERT INTO {final_tbl} ({col_list}) SELECT {col_list} FROM {temp_tbl}")
 
+        spark.sql(f"DROP TABLE IF EXISTS {temp_tbl}")
         print(f"[{_ts()}] DONE {table_name}")
 
     except Exception as e:
